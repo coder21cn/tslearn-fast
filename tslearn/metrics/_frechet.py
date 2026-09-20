@@ -16,7 +16,7 @@ from ._masks import (
 from .utils import (
     _cdist_generic,
     _njit_compute_path,
-    _compute_path
+    _compute_path,
 )
 
 
@@ -788,7 +788,44 @@ def _cdist_frechet(
 ):
     if be is None:
         be = instantiate_backend(dataset1, dataset2)
+
+    if (dataset2 is not None
+            and dataset1.shape[0] > 0 and dataset2.shape[0] > 0
+            and dataset1.shape[2] != dataset2.shape[2]):
+        raise ValueError(
+            "All input time series must have the same feature size."
+        )
+
+    constraint_code = GLOBAL_CONSTRAINT_CODE[global_constraint]
+    itakura_code = GLOBAL_CONSTRAINT_CODE["itakura"]
+    no_constraint_code = GLOBAL_CONSTRAINT_CODE[None]
+    # No eager ambiguous-constraint raise: ``_compute_mask`` raises
+    # per-pair in the non-empty fall-through, and main returns the
+    # empty matrix when no pair iterates.
+    use_itakura = constraint_code == itakura_code or (
+        constraint_code == no_constraint_code and itakura_max_slope is not None
+    )
+    if be.is_numpy and not use_itakura:
+        from ._frechet_fast import cdist_frechet_fast
+        result = cdist_frechet_fast(
+            dataset1=dataset1,
+            dataset2=dataset2,
+            global_constraint=constraint_code,
+            sakoe_chiba_radius=sakoe_chiba_radius,
+            n_jobs=n_jobs,
+            verbose=verbose,
+        )
+        if result is not None:
+            return result
+        # Fast path declined (non-int-valued radius); fall through.
+
     frechet_ = _njit_frechet if be.is_numpy else _frechet
+    # Pass the int-coded ``global_constraint`` (not the public string)
+    # so the per-pair mask comparisons match. Main forwards the string,
+    # which silently falls through to no-constraint inside numba — a
+    # latent bug where ``cdist_frechet(..., global_constraint="itakura")``
+    # quietly ignored the constraint. The single-pair ``frechet()`` was
+    # always correct because it converts to int before dispatching.
     return _cdist_generic(
         dist_fun=frechet_,
         dataset1=dataset1,
@@ -797,7 +834,7 @@ def _cdist_frechet(
         verbose=verbose,
         be=be,
         compute_diagonal=False,
-        global_constraint=global_constraint,
+        global_constraint=constraint_code,
         sakoe_chiba_radius=sakoe_chiba_radius,
         itakura_max_slope=itakura_max_slope,
     )

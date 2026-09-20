@@ -1,0 +1,23 @@
+{
+    "version": 1,
+    "project": "tslearn",
+    "project_url": "https://github.com/tslearn-team/tslearn",
+    "repo": ".",
+    "branches": ["main", "my"],
+    "environment_type": "virtualenv",
+    "install_timeout": 600,
+    "show_commit_url": "https://github.com/tslearn-team/tslearn/commit/",
+    "pythons": ["3.11"],
+    "matrix": {
+        "numpy": [],
+        "numba": [],
+        "scipy": [],
+        "joblib": [],
+        "scikit-learn": [],
+        "h5py": []
+    },
+    "benchmark_dir": "benchmarks",
+    "env_dir": ".asv/env",
+    "results_dir": ".asv/results",
+    "html_dir": ".asv/html"
+}

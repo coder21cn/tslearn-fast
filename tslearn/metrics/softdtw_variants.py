@@ -27,6 +27,7 @@ from .soft_dtw_fast import (
     _soft_dtw,
     _soft_dtw_grad,
 )
+from ._softdtw_fast import cdist_soft_dtw_fast, self_soft_dtw_diag_fast
 from .utils import _cdist_generic
 
 __author__ = "Romain Tavenard romain.tavenard[at]univ-rennes2.fr"
@@ -762,7 +763,8 @@ def soft_dtw_alignment(ts1, ts2, gamma=1.0, be=None, compute_with_backend=False)
     return a, dist_sq
 
 
-def cdist_soft_dtw(dataset1, dataset2=None, gamma=1.0, be=None, compute_with_backend=False):
+def cdist_soft_dtw(dataset1, dataset2=None, gamma=1.0, be=None,
+                   compute_with_backend=False, verbose=0):
     r"""Compute cross-similarity matrix using Soft-DTW metric.
 
     Soft-DTW was originally presented in [1]_ and is
@@ -864,7 +866,8 @@ def cdist_soft_dtw(dataset1, dataset2=None, gamma=1.0, be=None, compute_with_bac
         dataset2=dataset2,
         gamma=gamma,
         be=be,
-        compute_with_backend=compute_with_backend
+        compute_with_backend=compute_with_backend,
+        verbose=verbose,
     )
 
 
@@ -873,10 +876,21 @@ def  _cdist_soft_dtw(
     dataset2=None,
     gamma=1.0,
     be=None,
-    compute_with_backend=False
+    compute_with_backend=False,
+    verbose=0,
 ):
     if be is None:
         be = instantiate_backend(dataset1, dataset2)
+
+    # Non-finite gamma: the fast kernel divides by gamma inside numba
+    # and surfaces a SystemError; defer to the legacy path which raises
+    # ZeroDivisionError (matching main).
+    if be.is_numpy and not math.isclose(gamma, 0.0) and math.isfinite(gamma):
+        return cdist_soft_dtw_fast(
+            dataset1=dataset1, dataset2=dataset2, gamma=gamma,
+            verbose=verbose,
+        )
+
     if dataset2 is None:
         dataset2 = dataset1
         self_similarity = True
@@ -908,7 +922,8 @@ def  _cdist_soft_dtw(
     return dists
 
 
-def cdist_soft_dtw_normalized(dataset1, dataset2=None, gamma=1.0, be=None, compute_with_backend=False):
+def cdist_soft_dtw_normalized(dataset1, dataset2=None, gamma=1.0, be=None,
+                              compute_with_backend=False, verbose=0):
     r"""Compute cross-similarity matrix using a normalized version of the
     Soft-DTW metric.
 
@@ -1022,7 +1037,8 @@ def cdist_soft_dtw_normalized(dataset1, dataset2=None, gamma=1.0, be=None, compu
         dataset2=dataset2,
         gamma=gamma,
         be=be,
-        compute_with_backend=compute_with_backend
+        compute_with_backend=compute_with_backend,
+        verbose=verbose,
     )
 
 
@@ -1031,7 +1047,8 @@ def _cdist_soft_dtw_normalized(
     dataset2=None,
     gamma=1.0,
     be=None,
-    compute_with_backend=False
+    compute_with_backend=False,
+    verbose=0,
 ):
     if be is None:
         be = instantiate_backend(dataset1, dataset2)
@@ -1040,11 +1057,22 @@ def _cdist_soft_dtw_normalized(
         dataset2=dataset2,
         gamma=gamma,
         be=be,
-        compute_with_backend=compute_with_backend
+        compute_with_backend=compute_with_backend,
+        verbose=verbose,
     )
     if dataset2 is None:
         d_ii = be.diag(dists)
         normalizer = -0.5 * (be.reshape(d_ii, (-1, 1)) + be.reshape(d_ii, (1, -1)))
+    elif (be.is_numpy and not math.isclose(gamma, 0.0)
+            and math.isfinite(gamma)):
+        # Use the fused self-diagonal kernel so the self-distances are
+        # bit-equal to the cross kernel's diagonal. Non-finite gamma falls
+        # through to the per-pair legacy loop so the divide-by-gamma
+        # surfaces ZeroDivisionError matching main (the fused kernel
+        # raises a Numba SystemError on its own ``1/gamma``).
+        self1 = self_soft_dtw_diag_fast(dataset1, gamma)
+        self2 = self_soft_dtw_diag_fast(dataset2, gamma)
+        normalizer = -0.5 * (self1.reshape(-1, 1) + self2.reshape(1, -1))
     else:
         self_dists1 = be.empty((dataset1.shape[0], 1))
         for i, ts1 in enumerate(dataset1):
@@ -1213,6 +1241,11 @@ class SquaredEuclidean:
         D: array-like, shape=(m, n)
             Distance matrix.
         """
+        # ``pairwise_euclidean_distances`` returns unsquared L2; the ``** 2``
+        # produces ‖x−y‖² as required. Using sklearn's implementation rather
+        # than the textbook ``xx + yy - 2 X@Y.T`` avoids catastrophic
+        # cancellation on nearly-equal rows. Soft-DTW gradients feed L-BFGS,
+        # so per-call precision loss would compound across iterations.
         return self.be.pairwise_euclidean_distances(self.X, self.Y) ** 2
 
     def jacobian_product(self, E):

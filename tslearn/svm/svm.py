@@ -9,6 +9,7 @@ import numpy
 
 from tslearn.bases.bases import ALLOW_VARIABLE_LENGTH
 from ..metrics import _cdist_gak, gamma_soft_dtw, VARIABLE_LENGTH_METRICS
+from ..metrics._gak import _gak_self_inv_sqrt_diag
 from ..utils import to_time_series_dataset, check_array, check_dims, check_X_y, to_sklearn_dataset
 from ..bases import TimeSeriesMixin
 
@@ -70,17 +71,28 @@ class TimeSeriesSVMMixin(TimeSeriesMixin):
         if self.kernel in VARIABLE_LENGTH_METRICS:
             assert self.kernel == "gak"
             self.estimator_kernel_ = "precomputed"
+            sigma = numpy.sqrt(self.gamma_ / 2.)
             if fit_time:
                 sklearn_X = _cdist_gak(X,
-                                      sigma=numpy.sqrt(self.gamma_ / 2.),
+                                      sigma=sigma,
                                       n_jobs=self.n_jobs,
                                       verbose=self.verbose)
+                # Cache 1/sqrt(K(X_fit[i], X_fit[i])) so predict() can skip
+                # recomputing the right-side normalization on every call.
+                self.gak_inv_sqrt_diag_fit_ = _gak_self_inv_sqrt_diag(
+                    X, sigma=sigma, n_jobs=self.n_jobs, verbose=self.verbose
+                )
             else:
-                sklearn_X = _cdist_gak(X,
-                                      self._X_fit,
-                                      sigma=numpy.sqrt(self.gamma_ / 2.),
-                                      n_jobs=self.n_jobs,
-                                      verbose=self.verbose)
+                sklearn_X = _cdist_gak(
+                    X,
+                    self._X_fit,
+                    sigma=sigma,
+                    n_jobs=self.n_jobs,
+                    verbose=self.verbose,
+                    right_inv_sqrt_self=getattr(
+                        self, "gak_inv_sqrt_diag_fit_", None
+                    ),
+                )
 
         else:
             self.estimator_kernel_ = self.kernel

@@ -7,6 +7,26 @@ from sklearn.utils.validation import check_is_fitted
 from tslearn.bases import BaseModelPackage, TimeSeriesMixin
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 from tslearn.utils import check_array, check_dims
+from ._mp_fast import _run_mp_stomp
+
+
+def _series_to_segments(time_series, segment_size):
+    """Sliding window view of ``time_series`` with shape
+    ``(n - segment_size + 1, segment_size, d)``. Read-only view; no copy.
+    """
+    if time_series.ndim != 2:
+        raise ValueError(
+            "_series_to_segments expects a single (sz, d) time series; got "
+            f"shape {time_series.shape}"
+        )
+    elem_size = time_series.strides[0]
+    return as_strided(
+        time_series,
+        strides=(elem_size, elem_size, time_series.strides[1]),
+        shape=(time_series.shape[0] - segment_size + 1,
+               segment_size, time_series.shape[1]),
+        writeable=False,
+    )
 
 stumpy_msg = ('stumpy is not installed, stumpy features will not be'
               'supported.\n Install stumpy to use stumpy features:'
@@ -20,50 +40,6 @@ else:
     STUMPY_INSTALLED = True
 
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
-
-
-def _series_to_segments(time_series, segment_size):
-    """Transforms a time series (or a set of time series) into an array of its
-    segments of length segment_size.
-
-    Examples
-    --------
-    >>> from tslearn.utils import to_time_series
-    >>> time_series = to_time_series([1, 2, 3, 4, 5])
-    >>> segments = _series_to_segments(time_series, segment_size=2)
-    >>> segments.shape
-    (4, 2, 1)
-    >>> segments[:, :, 0]
-    array([[1., 2.],
-           [2., 3.],
-           [3., 4.],
-           [4., 5.]])
-    >>> from tslearn.utils import to_time_series_dataset
-    >>> dataset = to_time_series_dataset([time_series])
-    >>> dataset.shape
-    (1, 5, 1)
-    >>> segments = _series_to_segments(dataset, segment_size=2)
-    >>> segments.shape
-    (4, 2, 1)
-    >>> segments[:, :, 0]
-    array([[1., 2.],
-           [2., 3.],
-           [3., 4.],
-           [4., 5.]])
-    """
-    if time_series.ndim == 3:
-        l_segments = [_series_to_segments(ts, segment_size)
-                      for ts in time_series]
-        return np.vstack(l_segments)
-    elem_size = time_series.strides[0]
-    segments = as_strided(
-        time_series,
-        strides=(elem_size, elem_size, time_series.strides[1]),
-        shape=(time_series.shape[0] - segment_size + 1,
-               segment_size, time_series.shape[1]),
-        writeable=False
-    )
-    return segments
 
 
 class MatrixProfile(TimeSeriesMixin,
@@ -98,6 +74,18 @@ class MatrixProfile(TimeSeriesMixin,
          series to have zero mean and unit variance.
          Default for this parameter is set to `True` to match the standard
          matrix profile setup.
+
+    Notes
+    -----
+    Matrix profiles are restricted to univariate input (``d == 1``),
+    matching the public behavior of the upstream implementation. The
+    optimized ``"numpy"`` implementation keeps the same restriction for
+    drop-in compatibility.
+
+    Inputs containing non-finite values (``NaN`` / ``Inf``) bypass the
+    fast STOMP kernel and fall back to a pdist-based path that
+    propagates ``NaN`` cells through the matrix profile, matching the
+    legacy behavior.
 
     Examples
     --------
@@ -156,6 +144,11 @@ class MatrixProfile(TimeSeriesMixin,
         n_ts, sz, d = X.shape
 
         if d > 1:
+            # Main rejects any multivariate input here. The numpy STOMP
+            # kernel can handle ``d > 1``, but accepting it would produce
+            # results with no main-parity baseline. Restore main's
+            # blanket rejection to keep this branch behavior-preserving;
+            # multivariate support can land as a separate feature commit.
             raise NotImplementedError("We currently don't support using "
                                       "multi-dimensional matrix profiles "
                                       "from the stumpy library.")
@@ -184,21 +177,23 @@ class MatrixProfile(TimeSeriesMixin,
                 X_transformed[i_ts, :, 0] = result[:, 0].astype(float)
 
         elif self.implementation == "numpy":
-            scaler = TimeSeriesScalerMeanVariance()
             band_width = int(np.ceil(self.subsequence_length / 4))
             for i_ts in range(n_ts):
-                segments = _series_to_segments(X[i_ts], self.subsequence_length)
-                if self.scale:
-                    segments = scaler.fit_transform(segments)
-                n_segments = segments.shape[0]
-                segments_2d = segments.reshape((-1, self.subsequence_length * d))
-                dists = squareform(pdist(segments_2d, "euclidean"))
-                band = (np.tri(n_segments, n_segments,
-                            band_width, dtype=bool) &
-                        ~np.tri(n_segments, n_segments,
-                                -(band_width + 1), dtype=bool))
-                dists[band] = np.inf
-                X_transformed[i_ts] = dists.min(axis=1, keepdims=True)
+                ts = np.ascontiguousarray(X[i_ts], dtype=np.float64)
+                # STOMP's std>EPS guard and the unscaled formula both
+                # silently swallow NaN cells, so non-finite inputs
+                # diverge from main's pdist path. Fall back per series.
+                if np.isfinite(ts).all() and self._stomp_safe(ts):
+                    mins_sq = np.empty(output_size, dtype=np.float64)
+                    _run_mp_stomp(
+                        ts, self.subsequence_length, self.scale,
+                        band_width, mins_sq,
+                    )
+                    X_transformed[i_ts] = np.sqrt(mins_sq)[:, None]
+                else:
+                    X_transformed[i_ts] = self._numpy_pdist_matrix_profile(
+                        ts, band_width
+                    )
 
         else:
             available_implementations = ["numpy", "stump", "gpu_stump"]
@@ -210,6 +205,60 @@ class MatrixProfile(TimeSeriesMixin,
             )
 
         return X_transformed
+
+    def _stomp_safe(self, ts):
+        """Gate the STOMP recurrence on per-subsequence mean-to-std ratio.
+
+        For ``scale=True``, STOMP computes the centered cross-product as
+        ``qt - m*mu_i*mu_j``, which suffers catastrophic cancellation
+        when ``|mu|`` is large relative to ``sig`` (e.g. drift signals,
+        non-zero-mean signals). Main's pdist path z-normalizes each
+        segment first and avoids the cancellation. When the ratio is
+        too high, fall back to pdist to preserve numerical parity.
+
+        For ``scale=False`` STOMP is numerically well-behaved and we
+        always take the fast path.
+        """
+        if not self.scale:
+            return True
+        m = self.subsequence_length
+        sz = ts.shape[0]
+        n = sz - m + 1
+        if n < 1:
+            return True
+        cs = np.concatenate(
+            [np.zeros((1, ts.shape[1])),
+             np.cumsum(ts, axis=0, dtype=np.float64)]
+        )
+        cs2 = np.concatenate(
+            [np.zeros((1, ts.shape[1])),
+             np.cumsum(ts * ts, axis=0, dtype=np.float64)]
+        )
+        sums = cs[m:m + n] - cs[:n]
+        sums2 = cs2[m:m + n] - cs2[:n]
+        mu = sums / m
+        var = np.maximum(sums2 / m - mu * mu, 0.0)
+        sig = np.sqrt(var)
+        # 50 picked empirically: at ratio=50, cancellation costs ~3
+        # decimal digits of the ~16 in float64, leaving the recurrence
+        # well within main's pdist parity tolerance (1e-9 in the harness).
+        return bool((np.abs(mu) <= 50.0 * (sig + 1e-12)).all())
+
+    def _numpy_pdist_matrix_profile(self, ts, band_width):
+        """Pdist-based matrix profile that propagates NaN. Mirrors
+        main's segment / scaler / pdist pipeline, used as a fallback
+        when the STOMP recurrence would silently swallow NaN cells."""
+        m = self.subsequence_length
+        segments = _series_to_segments(ts, m)
+        if self.scale:
+            segments = TimeSeriesScalerMeanVariance().fit_transform(segments)
+        n = segments.shape[0]
+        flat = segments.reshape(n, m * ts.shape[1])
+        dists = squareform(pdist(flat, metric="euclidean"))
+        band = (np.tri(n, n, band_width, dtype=bool)
+                & ~np.tri(n, n, -(band_width + 1), dtype=bool))
+        dists[band] = np.inf
+        return dists.min(axis=1, keepdims=True)
 
     def transform(self, X, y=None):
         """Transform a dataset of time series into its Matrix Profile

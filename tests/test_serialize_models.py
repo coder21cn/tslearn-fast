@@ -1,5 +1,5 @@
-from glob import glob
-import os
+import tempfile
+from pathlib import Path
 
 import numpy
 
@@ -18,28 +18,10 @@ from tslearn.piecewise import PiecewiseAggregateApproximation, \
     SymbolicAggregateApproximation, OneD_SymbolicAggregateApproximation
 
 
-tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 all_formats = ['json', 'hdf5', 'pickle']
 
 
-try:
-    os.makedirs(tmp_dir)
-except (FileExistsError, OSError):
-    pass
-
-
-def teardown_module():
-    clear_tmp()
-    os.removedirs(tmp_dir)
-
-
-def clear_tmp():
-    files = glob(os.path.join(tmp_dir, '*'))
-    for f in files:
-        os.remove(f)
-
-
-def test_hdftools():
+def test_hdftools(tmp_path):
     dtypes = [int, numpy.int8, numpy.int16, numpy.int32, numpy.int64,
               float, numpy.float32, numpy.float64]
 
@@ -49,7 +31,7 @@ def test_hdftools():
         name = numpy.dtype(dtype).name
         d[name] = (numpy.random.rand(100, 100) * 10).astype(dtype)
 
-    fname = os.path.join(tmp_dir, 'hdf_test.hdf5')
+    fname = str(tmp_path / 'hdf_test.hdf5')
 
     hdftools.save_dict(d, filename=fname, group='data')
 
@@ -59,36 +41,34 @@ def test_hdftools():
         numpy.testing.assert_equal(d[k], d2[k])
 
 
-def _check_not_fitted(model):
+def _check_not_fitted(model, tmp_path):
     # not serializable if not fitted
     for fmt in all_formats:
         with pytest.raises(NotFittedError):
             getattr(model, "to_{}".format(fmt))(
-                os.path.join(
-                    tmp_dir, "{}.{}".format(model.__class__.__name__, fmt)
-                )
+                str(tmp_path / "{}.{}".format(model.__class__.__name__, fmt))
             )
 
 
-def _check_params_predict(model, X, test_methods, check_params_fun=None,
+def _check_params_predict(model, X, test_methods, tmp_path,
+                          check_params_fun=None,
                           formats=None, exclude_hyper_params=None):
     if formats is None:
         formats = all_formats
-    # serialize to all all_formats
+    # Each call gets its own sub-dir: tests sometimes serialize the same
+    # class twice (different configs) within one test, and hdftools
+    # refuses to overwrite an existing target.
+    sub = Path(tempfile.mkdtemp(dir=str(tmp_path)))
     for fmt in formats:
         getattr(model, "to_{}".format(fmt))(
-            os.path.join(
-                tmp_dir, "{}.{}".format(model.__class__.__name__, fmt)
-            )
+            str(sub / "{}.{}".format(model.__class__.__name__, fmt))
         )
 
     # loaded models should have same model params
     # and provide the same predictions
     for fmt in formats:
         sm = getattr(model, "from_{}".format(fmt))(
-            os.path.join(
-                tmp_dir, "{}.{}".format(model.__class__.__name__, fmt)
-            )
+            str(sub / "{}.{}".format(model.__class__.__name__, fmt))
         )
 
         # make sure it's restored to the same class
@@ -117,10 +97,8 @@ def _check_params_predict(model, X, test_methods, check_params_fun=None,
                 continue
             numpy.testing.assert_equal(getattr(model, p), getattr(sm, p))
 
-    clear_tmp()
 
-
-def test_serialize_global_alignment_kernel_kmeans():
+def test_serialize_global_alignment_kernel_kmeans(tmp_path):
     n, sz, d = 15, 10, 3
     rng = numpy.random.RandomState(0)
     X = rng.randn(n, sz, d)
@@ -128,14 +106,14 @@ def test_serialize_global_alignment_kernel_kmeans():
     gak_km = KernelKMeans(n_clusters=3, verbose=False,
                           max_iter=5)
 
-    _check_not_fitted(gak_km)
+    _check_not_fitted(gak_km, tmp_path)
 
     gak_km.fit(X)
 
-    _check_params_predict(gak_km, X, ['predict'])
+    _check_params_predict(gak_km, X, ['predict'], tmp_path)
 
 
-def test_serialize_timeserieskmeans():
+def test_serialize_timeserieskmeans(tmp_path):
     n, sz, d = 15, 10, 3
     rng = numpy.random.RandomState(0)
     X = rng.randn(n, sz, d)
@@ -146,25 +124,25 @@ def test_serialize_timeserieskmeans():
                               verbose=True,
                               max_iter_barycenter=10)
 
-    _check_not_fitted(dba_km)
+    _check_not_fitted(dba_km, tmp_path)
 
     dba_km.fit(X)
 
-    _check_params_predict(dba_km, X, ['predict'])
+    _check_params_predict(dba_km, X, ['predict'], tmp_path)
 
     sdtw_km = TimeSeriesKMeans(n_clusters=3,
                                metric="softdtw",
                                metric_params={"gamma": .01},
                                verbose=True)
 
-    _check_not_fitted(sdtw_km)
+    _check_not_fitted(sdtw_km, tmp_path)
 
     sdtw_km.fit(X)
 
-    _check_params_predict(sdtw_km, X, ['predict'])
+    _check_params_predict(sdtw_km, X, ['predict'], tmp_path)
 
 
-def test_serialize_kshape():
+def test_serialize_kshape(tmp_path):
     n, sz, d = 15, 10, 3
     rng = numpy.random.RandomState(0)
     time_series = rng.randn(n, sz, d)
@@ -172,25 +150,25 @@ def test_serialize_kshape():
 
     ks = KShape(n_clusters=3, verbose=True)
 
-    _check_not_fitted(ks)
+    _check_not_fitted(ks, tmp_path)
 
     ks.fit(X)
 
-    _check_params_predict(ks, X, ['predict'])
+    _check_params_predict(ks, X, ['predict'], tmp_path)
 
     seed_ixs = [numpy.random.randint(0, X.shape[0] - 1) for i in range(3)]
     seeds = numpy.array([X[i] for i in seed_ixs])
 
     ks_seeded = KShape(n_clusters=3, verbose=True, init=seeds)
 
-    _check_not_fitted(ks_seeded)
+    _check_not_fitted(ks_seeded, tmp_path)
 
     ks_seeded.fit(X)
 
-    _check_params_predict(ks_seeded, X, ['predict'])
+    _check_params_predict(ks_seeded, X, ['predict'], tmp_path)
 
 
-def test_serialize_knn():
+def test_serialize_knn(tmp_path):
     n, sz, d = 15, 10, 3
     rng = numpy.random.RandomState(0)
     X = rng.randn(n, sz, d)
@@ -200,14 +178,14 @@ def test_serialize_knn():
 
     knn = KNeighborsTimeSeries(n_neighbors=n_neighbors)
 
-    _check_not_fitted(knn)
+    _check_not_fitted(knn, tmp_path)
 
     knn.fit(X, y)
 
-    _check_params_predict(knn, X, ['kneighbors'])
+    _check_params_predict(knn, X, ['kneighbors'], tmp_path)
 
 
-def test_serialize_knn_classifier():
+def test_serialize_knn_classifier(tmp_path):
     n, sz, d = 15, 10, 3
     rng = numpy.random.RandomState(0)
     X = rng.randn(n, sz, d)
@@ -215,11 +193,11 @@ def test_serialize_knn_classifier():
 
     knc = KNeighborsTimeSeriesClassifier()
 
-    _check_not_fitted(knc)
+    _check_not_fitted(knc, tmp_path)
 
     knc.fit(X, y)
 
-    _check_params_predict(knc, X, ['predict'])
+    _check_params_predict(knc, X, ['predict'], tmp_path)
 
 
 def _get_random_walk():
@@ -231,35 +209,35 @@ def _get_random_walk():
     return scaler.fit_transform(dataset)
 
 
-def test_serialize_paa():
+def test_serialize_paa(tmp_path):
     X = _get_random_walk()
     # PAA transform (and inverse transform) of the data
     n_paa_segments = 10
     paa = PiecewiseAggregateApproximation(n_segments=n_paa_segments)
 
-    _check_not_fitted(paa)
+    _check_not_fitted(paa, tmp_path)
 
     paa.fit(X)
 
-    _check_params_predict(paa, X, ['transform'])
+    _check_params_predict(paa, X, ['transform'], tmp_path)
 
 
-def test_serialize_sax():
+def test_serialize_sax(tmp_path):
     n_paa_segments = 10
     n_sax_symbols = 8
     sax = SymbolicAggregateApproximation(n_segments=n_paa_segments,
                                          alphabet_size_avg=n_sax_symbols)
 
-    _check_not_fitted(sax)
+    _check_not_fitted(sax, tmp_path)
 
     X = _get_random_walk()
 
     sax.fit(X)
 
-    _check_params_predict(sax, X, ['transform'])
+    _check_params_predict(sax, X, ['transform'], tmp_path)
 
 
-def test_serialize_1dsax():
+def test_serialize_1dsax(tmp_path):
 
     n_paa_segments = 10
     n_sax_symbols_avg = 8
@@ -270,15 +248,15 @@ def test_serialize_1dsax():
         alphabet_size_avg=n_sax_symbols_avg,
         alphabet_size_slope=n_sax_symbols_slope)
 
-    _check_not_fitted(one_d_sax)
+    _check_not_fitted(one_d_sax, tmp_path)
 
     X = _get_random_walk()
     one_d_sax.fit(X)
 
-    _check_params_predict(one_d_sax, X, ['transform'])
+    _check_params_predict(one_d_sax, X, ['transform'], tmp_path)
 
 
-def test_serialize_shapelets():
+def test_serialize_shapelets(tmp_path):
     shapelets = pytest.importorskip('tslearn.shapelets', exc_type=ImportError)
     from keras.optimizers import Adam
 
@@ -294,9 +272,9 @@ def test_serialize_shapelets():
 
         # Test with default args
         shp = shapelets.LearningShapelets(max_iter=1)
-        _check_not_fitted(shp)
+        _check_not_fitted(shp, tmp_path)
         shp.fit(X, y)
-        _check_params_predict(shp, X, ['predict'],
+        _check_params_predict(shp, X, ['predict'], tmp_path,
                               check_params_fun=get_model_weights,
                               formats=["json", "pickle"])
 
@@ -308,12 +286,13 @@ def test_serialize_shapelets():
             max_size=10,
             random_state=42
         )
-        _check_not_fitted(shp)
+        _check_not_fitted(shp, tmp_path)
         shp.fit(X, y)
         _check_params_predict(
             shp,
             X,
             ['predict'],
+            tmp_path,
             check_params_fun=get_model_weights,
             formats=["json", "pickle"],
             exclude_hyper_params=["optimizer"]
@@ -321,6 +300,6 @@ def test_serialize_shapelets():
 
         # HDF5 serialization not supported
         with pytest.raises(NotImplementedError):
-            _check_params_predict(shp, X, ['predict'],
+            _check_params_predict(shp, X, ['predict'], tmp_path,
                                   check_params_fun=get_model_weights,
                                   formats=["hdf5"])

@@ -5,6 +5,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Differential-parity harness scratch worktree
+.main_parity_wt/
+
 # C extensions
 *.so
 
@@ -117,3 +120,6 @@ docs/**/sg_execution_times.rst
 # Local files
 private_info.md
 release.sh
+
+# asv benchmark artefacts
+.asv/

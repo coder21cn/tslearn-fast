@@ -146,10 +146,24 @@ class PiecewiseAggregateApproximation(TimeSeriesMixin,
 
     def _transform(self, X, y=None):
         n_ts, sz, d = X.shape
-        X_transformed = numpy.empty((n_ts, self.n_segments, d))
+        n_seg = self.n_segments
+        # Fast path: all series at full length sz (no trailing NaN). Reshape
+        # the truncated (n_ts, n_seg * sz_seg, d) prefix into segments and
+        # mean along the per-segment axis. Equivalent to the per-(i_ts, i_seg)
+        # loop because `_ts_size` returns sz when no trailing NaN is present.
+        if sz > 0 and not numpy.isnan(X[:, -1, :]).any():
+            sz_segment = sz // n_seg
+            if sz_segment > 0:
+                truncated = sz_segment * n_seg
+                return (
+                    X[:, :truncated, :]
+                    .reshape(n_ts, n_seg, sz_segment, d)
+                    .mean(axis=2)
+                )
+        X_transformed = numpy.empty((n_ts, n_seg, d))
         for i_ts in range(n_ts):
-            sz_segment = _ts_size(X[i_ts]) // self.n_segments
-            for i_seg in range(self.n_segments):
+            sz_segment = _ts_size(X[i_ts]) // n_seg
+            for i_seg in range(n_seg):
                 start = i_seg * sz_segment
                 end = start + sz_segment
                 segment = X[i_ts, start:end, :]

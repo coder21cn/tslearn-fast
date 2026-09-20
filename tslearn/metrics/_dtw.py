@@ -16,8 +16,38 @@ from ._masks import (
 from .utils import (
     _njit_compute_path,
     _compute_path,
-    _cdist_generic
+    _cdist_generic,
+    _is_int_valued_finite,
 )
+from ._dtw_fast import (
+    cdist_dtw_fast,
+    _njit_dtw_sakoe,
+    _njit_dtw_path_sakoe,
+)
+
+
+def _sakoe_fast_inputs(
+    be, global_constraint_, sakoe_chiba_radius, itakura_max_slope, s1, s2,
+):
+    """Gate for the single-pair Sakoe-Chiba fast path. Returns
+    ``(s1c, s2c, radius)`` if the fused kernel is safe to call, else ``None``.
+
+    The kernel is unconstrained-or-Sakoe only, requires an int-valued radius,
+    and the band-iteration recurrence chooses different ties on NaN/Inf
+    cells than the legacy mask DP — fall back when any non-finite value is
+    present so callers can rely on parity.
+    """
+    if not (be.is_numpy
+            and itakura_max_slope is None
+            and sakoe_chiba_radius is not None
+            and global_constraint_ != GLOBAL_CONSTRAINT_CODE["itakura"]
+            and _is_int_valued_finite(sakoe_chiba_radius)):
+        return None
+    s1c = numpy.ascontiguousarray(s1, dtype=numpy.float64)
+    s2c = numpy.ascontiguousarray(s2, dtype=numpy.float64)
+    if not (numpy.isfinite(s1c).all() and numpy.isfinite(s2c).all()):
+        return None
+    return s1c, s2c, int(sakoe_chiba_radius)
 
 
 def dtw(
@@ -149,6 +179,13 @@ def dtw(
 
     global_constraint_ = GLOBAL_CONSTRAINT_CODE[global_constraint]
 
+    fast = _sakoe_fast_inputs(
+        be, global_constraint_, sakoe_chiba_radius, itakura_max_slope, s1, s2,
+    )
+    if fast is not None:
+        s1c, s2c, radius = fast
+        return _njit_dtw_sakoe(s1c, s2c, radius)
+
     if be.is_numpy:
         dtw_ = _njit_dtw
     else:
@@ -261,6 +298,14 @@ def dtw_path(
         raise ValueError("All input time series must have the same feature size.")
 
     global_constraint_ = GLOBAL_CONSTRAINT_CODE[global_constraint]
+
+    fast = _sakoe_fast_inputs(
+        be, global_constraint_, sakoe_chiba_radius, itakura_max_slope, s1, s2,
+    )
+    if fast is not None:
+        s1c, s2c, radius = fast
+        dist, path = _njit_dtw_path_sakoe(s1c, s2c, radius)
+        return path, dist
 
     if be.is_numpy:
         dtw_path_ = _njit_dtw_path
@@ -560,6 +605,30 @@ def _cdist_dtw(
 ):
     if be is None:
         be = instantiate_backend(dataset1, dataset2)
+
+    if (dataset2 is not None
+            and dataset1.shape[0] > 0 and dataset2.shape[0] > 0
+            and dataset1.shape[2] != dataset2.shape[2]):
+        raise ValueError(
+            "All input time series must have the same feature size."
+        )
+
+    constraint_code = GLOBAL_CONSTRAINT_CODE[global_constraint]
+
+    if be.is_numpy:
+        result = cdist_dtw_fast(
+            dataset1=dataset1,
+            dataset2=dataset2,
+            global_constraint=constraint_code,
+            sakoe_chiba_radius=sakoe_chiba_radius,
+            itakura_max_slope=itakura_max_slope,
+            n_jobs=n_jobs,
+            verbose=verbose,
+        )
+        if result is not None:
+            return result
+        # Fast path declined (variable-length under Itakura); fall through.
+
     dtw_ = _njit_dtw if be.is_numpy else _dtw
     return _cdist_generic(
         dist_fun=dtw_,
@@ -569,7 +638,7 @@ def _cdist_dtw(
         verbose=verbose,
         be=be,
         compute_diagonal=False,
-        global_constraint=GLOBAL_CONSTRAINT_CODE[global_constraint],
+        global_constraint=constraint_code,
         sakoe_chiba_radius=sakoe_chiba_radius,
         itakura_max_slope=itakura_max_slope,
     )

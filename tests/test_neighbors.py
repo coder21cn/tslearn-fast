@@ -118,3 +118,28 @@ def test_k_neighbors_classifier():
 
     # First column will contain zeroes
     np.testing.assert_array_less(sax_dist[:, 1:], euc_dist[:, 1:])
+
+
+def test_dtw_kneighbors_clamps_k_to_fitted_population():
+    # Regression: when n_neighbors > n_fit, the DTW LB-prune fast path
+    # used to return padded -1 indices and +inf distances. It must
+    # behave like the fallback and clip to the fitted population size.
+    rng = np.random.RandomState(0)
+    n_fit = 5
+    X_fit = rng.randn(n_fit, 20, 1)
+    X_query = rng.randn(2, 20, 1)
+
+    model = KNeighborsTimeSeries(
+        n_neighbors=3, metric="dtw",
+        metric_params={"sakoe_chiba_radius": 2},
+    ).fit(X_fit)
+
+    dists, idxs = model.kneighbors(X_query, n_neighbors=10,
+                                   return_distance=True)
+    assert dists.shape == (2, n_fit)
+    assert idxs.shape == (2, n_fit)
+    assert not (idxs == -1).any()
+    assert not np.isinf(dists).any()
+    # All indices must point to the fitted corpus.
+    assert idxs.min() >= 0
+    assert idxs.max() < n_fit

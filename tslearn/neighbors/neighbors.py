@@ -16,6 +16,8 @@ from tslearn.metrics import (
     _cdist_frechet,
     TSLEARN_VALID_METRICS
 )
+from tslearn.metrics._dtw_lb import cdist_dtw_topk_fast
+from tslearn.metrics.utils import _sakoe_radius_for_fast_path
 from tslearn.piecewise import SymbolicAggregateApproximation
 from tslearn.utils import (
     to_time_series_dataset,
@@ -383,6 +385,28 @@ class KNeighborsTimeSeries(KNeighborsTimeSeriesMixin,
             X = check_dims(X, X_fit_dims=self._ts_fit.shape, extend=True,
                            check_n_features_only=True)
             if self._ts_metric == "dtw":
+                k_eff = n_neighbors if n_neighbors is not None else self.n_neighbors
+                # sklearn's fallback path clips k to the fitted population, so
+                # the fast path must do the same to keep behavior consistent.
+                k_eff = min(k_eff, self._ts_fit.shape[0])
+                # The LB-prune top-k kernel is Sakoe-Chiba-only and allocates
+                # an output of shape (n_query, k); fall through to the legacy
+                # path for Itakura / ambiguous constraints (radius is None)
+                # and for k < 1 (sklearn handles negative / zero counts
+                # itself, e.g. n_neighbors=-1 means "n_fit - 1").
+                radius = _sakoe_radius_for_fast_path(metric_params)
+                fast = cdist_dtw_topk_fast(
+                    dataset_query=X,
+                    dataset_candidates=self._ts_fit,
+                    k=k_eff,
+                    radius=radius,
+                    n_jobs=self.n_jobs,
+                ) if radius is not None and k_eff >= 1 else None
+                if fast is not None:
+                    self.metric = self._ts_metric
+                    if return_distance:
+                        return fast
+                    return fast[1]
                 X_ = _cdist_dtw(
                     X,
                     self._ts_fit,

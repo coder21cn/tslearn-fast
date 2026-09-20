@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import tslearn.barycenters
 from tslearn.utils import to_time_series
@@ -6,6 +7,17 @@ from tslearn.utils import to_time_series
 
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
 
+
+def test_dba_petitjean_zero_weights_raises():
+    # Regression: vectorized ``_petitjean_update_barycenter`` divides
+    # by ``bary_w`` directly, so all-zero ``weights`` would silently
+    # return a NaN barycenter. Main raised ``ZeroDivisionError`` from
+    # the per-position ``numpy.average``; preserve that.
+    X = [[1, 2, 3], [4, 5, 6]]
+    with pytest.raises(ZeroDivisionError, match="Weights sum to zero"):
+        tslearn.barycenters.dtw_barycenter_averaging_petitjean(
+            X, max_iter=1, weights=np.array([0.0, 0.0]),
+        )
 
 
 def test_set_weights():

@@ -1111,3 +1111,31 @@ def test_sax():
         dataset2=[[-1, 0, 1], [1, 0, 1]],
     )
     np.testing.assert_equal(dists, expected)
+
+
+def test_cdist_dtw_ambiguous_constraint_raises():
+    # Regression: when no global_constraint is named but both
+    # sakoe_chiba_radius and itakura_max_slope are supplied, the
+    # cdist fast path used to silently pick Sakoe-Chiba. The
+    # single-pair `dtw` call raises RuntimeWarning here, so cdist
+    # must agree.
+    rng = np.random.RandomState(0)
+    X = rng.randn(4, 12, 1)
+
+    with pytest.raises(RuntimeWarning, match="global_constraint is not set"):
+        tslearn.metrics.cdist_dtw(
+            X, X, sakoe_chiba_radius=2, itakura_max_slope=2.0
+        )
+
+    # Single-pair `dtw` keeps raising too — pin the parity.
+    with pytest.raises(RuntimeWarning, match="global_constraint is not set"):
+        tslearn.metrics.dtw(
+            X[0], X[1], sakoe_chiba_radius=2, itakura_max_slope=2.0
+        )
+
+    # When global_constraint is set, no raise (sanity check).
+    out = tslearn.metrics.cdist_dtw(
+        X, X, global_constraint="sakoe_chiba",
+        sakoe_chiba_radius=2, itakura_max_slope=2.0,
+    )
+    assert out.shape == (4, 4)

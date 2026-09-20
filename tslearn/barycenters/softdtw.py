@@ -6,6 +6,7 @@ from scipy.optimize import minimize
 
 from tslearn.backend import instantiate_backend
 from tslearn.metrics import SquaredEuclidean, SoftDTW
+from tslearn.metrics._softdtw_fast import softdtw_obj_grad_fast
 from tslearn.preprocessing import TimeSeriesResampler
 from tslearn.utils import to_time_series_dataset
 from tslearn.utils.utils import _check_equal_size, _to_time_series
@@ -104,10 +105,62 @@ def softdtw_barycenter(X, gamma=1.0, weights=None, method="L-BFGS-B", tol=1e-3,
         barycenter = init
 
     if max_iter > 0:
-        X_ = [_to_time_series(d, True, backend) for d in X_]
+        # Reject zero-length / fully-NaN series. The fused per-i objective
+        # contributes 0/0 for these (matching the legacy `_softdtw_func`
+        # behavior), which silently drops them from the barycenter
+        # optimization. Soft-DTW barycenter against empty series is
+        # mathematically undefined; raise so the caller fixes their input.
+        # Gated on max_iter > 0 because a 0-iter call returns init
+        # unchanged on main without inspecting members.
+        if backend.is_numpy and X_.shape[0] > 0:
+            from tslearn.utils.utils import _ts_size
+            for i in range(X_.shape[0]):
+                if _ts_size(X_[i]) == 0:
+                    raise ValueError(
+                        "softdtw_barycenter input contains a zero-length / "
+                        "all-NaN time series at index {}; the barycenter "
+                        "optimization is undefined for empty members.".format(i)
+                    )
 
-        def f(Z):
-            return _softdtw_func(Z, X_, weights, barycenter, gamma)
+        # Numpy fast path: pre-pad the per-series tensor once; the fused
+        # parallel kernel computes (value, G) for all i in parallel inside
+        # each scipy.optimize callback. Zero / non-finite gamma falls through
+        # to the legacy ``_softdtw_func`` so divide-by-gamma surfaces the
+        # same exception main raises.
+        if backend.is_numpy and gamma != 0.0 and numpy.isfinite(gamma):
+            from tslearn.metrics.utils import (
+                _assert_finite_over_valid_prefixes,
+            )
+            from sklearn.utils.validation import assert_all_finite
+            trimmed = [_to_time_series(d, True, backend) for d in X_]
+            n_X = len(trimmed)
+            d = barycenter.shape[1]
+            max_n = max((t.shape[0] for t in trimmed), default=0)
+            X_padded = numpy.zeros((n_X, max_n, d), dtype=numpy.float64)
+            lens_X = numpy.empty(n_X, dtype=numpy.int64)
+            for i, t in enumerate(trimmed):
+                lens_X[i] = t.shape[0]
+                X_padded[i, :t.shape[0], :] = t
+            # The fused per-i objective doesn't go through SquaredEuclidean,
+            # so mid-series NaN/Inf in the inputs (or the init/barycenter)
+            # would silently produce a 0-objective + 0-gradient and the
+            # L-BFGS would return the initial barycenter. The legacy
+            # `_softdtw_func` path raises via SquaredEuclidean.compute.
+            _assert_finite_over_valid_prefixes(X_padded, lens=lens_X)
+            assert_all_finite(barycenter)
+            w64 = numpy.asarray(weights, dtype=numpy.float64)
+            bary_shape = barycenter.shape
+
+            def f(Z):
+                obj, G = softdtw_obj_grad_fast(
+                    Z.reshape(bary_shape), X_padded, lens_X, w64, gamma
+                )
+                return obj, G.ravel()
+        else:
+            X_ = [_to_time_series(d, True, backend) for d in X_]
+
+            def f(Z):
+                return _softdtw_func(Z, X_, weights, barycenter, gamma)
 
         # The function works with vectors so we need to vectorize barycenter.
         res = minimize(f, barycenter.ravel(), method=method, jac=True, tol=tol,

@@ -7,6 +7,7 @@ from sklearn.utils.validation import check_is_fitted
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 from tslearn.utils import to_time_series_dataset, check_dims, check_array
 from tslearn.metrics import cdist_normalized_cc, y_shifted_sbd_vec
+from tslearn.metrics.utils import numba_threads_for
 from tslearn.bases import BaseModelPackage
 
 from .utils import (TimeSeriesCentroidBasedClusteringMixin,
@@ -60,6 +61,16 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
         If an ndarray is passed, it should be of shape (n_clusters, ts_size, d)
         and gives the initial centers.
 
+    n_jobs : int or None, optional (default=None)
+        The number of jobs to run in parallel for the per-cluster shape
+        extraction step in ``_update_centroids``. Cluster updates are
+        independent across ``k``, so this scales near-linearly when
+        ``n_clusters`` is comparable to or larger than the available cores.
+        ``None`` (default) means a single process. ``-1`` means using all
+        processors. See scikit-learn's
+        `Glossary <https://scikit-learn.org/stable/glossary.html#term-n_jobs>`_
+        for details.
+
     Attributes
     ----------
     cluster_centers_ : numpy.ndarray of shape (sz, d).
@@ -94,7 +105,7 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
     """
 
     def __init__(self, n_clusters=3, max_iter=100, tol=1e-6, n_init=1,
-                 verbose=False, random_state=None, init='random'):
+                 verbose=False, random_state=None, init='random', n_jobs=None):
         self.n_clusters = n_clusters
         self.max_iter = max_iter
         self.tol = tol
@@ -102,6 +113,7 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
         self.n_init = n_init
         self.verbose = verbose
         self.init = init
+        self.n_jobs = n_jobs
 
     def _is_fitted(self):
         """
@@ -125,8 +137,13 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
         mu_k_list = []
         for i in range(d):
             S = numpy.dot(Xp[:, :, i].T, Xp[:, :, i])
-            Q = numpy.eye(sz) - numpy.ones((sz, sz)) / sz
-            M = numpy.dot(Q.T, numpy.dot(S, Q))
+            # Q^T S Q where Q = I - 11^T / sz is the centering matrix.
+            # Symmetric Q, so Q^T S Q = Q S Q, which equals double-centering S
+            # by row and column means. Drops two (sz,sz) matmuls per dim.
+            M = (S
+                 - S.mean(axis=0, keepdims=True)
+                 - S.mean(axis=1, keepdims=True)
+                 + S.mean())
             _, vec = numpy.linalg.eigh(M)
             mu_k = vec[:, -1].reshape((sz, 1))
 
@@ -143,8 +160,28 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
         return mu_k
 
     def _update_centroids(self, X):
-        for k in range(self.n_clusters):
-            self.cluster_centers_[k] = self._shape_extraction(X, k)
+        # Per-cluster shape extraction is independent across ``k``, and the
+        # heavy work (BLAS matmul, eigh, y_shifted_sbd_vec) releases the GIL,
+        # so threads scale even when individual clusters are small.
+        # ``y_shifted_sbd_vec`` is itself ``@njit(parallel=True)``; force
+        # numba to one thread inside each outer worker so we don't spawn
+        # ``n_jobs * numba_default_threads`` OS threads (oversubscription
+        # was the source of the surprisingly-large measured speedups).
+        if self.n_jobs not in (None, 1) and self.n_clusters > 1:
+            from joblib import Parallel, delayed
+
+            def _extract_one(k):
+                with numba_threads_for(1):
+                    return self._shape_extraction(X, k)
+
+            results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
+                delayed(_extract_one)(k) for k in range(self.n_clusters)
+            )
+            for k, c in enumerate(results):
+                self.cluster_centers_[k] = c
+        else:
+            for k in range(self.n_clusters):
+                self.cluster_centers_[k] = self._shape_extraction(X, k)
         self.cluster_centers_ = TimeSeriesScalerMeanVariance(
             mu=0., std=1.).fit_transform(self.cluster_centers_)
         self.norms_centroids_ = numpy.linalg.norm(self.cluster_centers_,

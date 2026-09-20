@@ -64,11 +64,7 @@ class TimeSeriesResampler(TimeSeriesMixin, TransformerMixin, BaseEstimator):
         return self
 
     def _transform_unit_sz(self, X):
-        n_ts, sz, d = X.shape
-        X_out = numpy.empty((n_ts, 1, d))
-        for i in range(X.shape[0]):
-            X_out[i] = numpy.nanmean(X[i], axis=0, keepdims=True)
-        return X_out
+        return numpy.nanmean(X, axis=1, keepdims=True)
 
     def fit_transform(self, X, y=None, **kwargs):
         """Fit to data, then transform it.
@@ -114,6 +110,24 @@ class TimeSeriesResampler(TimeSeriesMixin, TransformerMixin, BaseEstimator):
 
         n_ts, sz, d = X_.shape
         equal_size = _check_equal_size(X_)
+        # The vectorized fast path uses ``X_[:, floor] * w0 + X_[:, floor+1] * w1``,
+        # so when frac is 0 or 1 the unused endpoint still pays ``0 * NaN = NaN``
+        # and contaminates exact-grid samples. ``np.interp`` (the per-series
+        # fallback below) preserves NaNs correctly. Bail to the fallback when
+        # any non-finite value is present — ``sum()`` is a one-pass check
+        # (NaN propagates through sum; both +inf and -inf give non-finite).
+        if equal_size and sz >= 2 and numpy.isfinite(X_.sum()):
+            # All series at full length sz; the source/target interp grids
+            # are identical across (i, d), so fold the per-(i, d) np.interp
+            # loop into a single broadcast linear interpolation.
+            u = numpy.linspace(0, 1, target_sz)
+            s = u * (sz - 1)
+            floor = numpy.floor(s).astype(numpy.int64)
+            numpy.clip(floor, 0, sz - 2, out=floor)
+            frac = s - floor
+            w0 = (1.0 - frac)[None, :, None]
+            w1 = frac[None, :, None]
+            return X_[:, floor, :] * w0 + X_[:, floor + 1, :] * w1
         X_out = numpy.empty((n_ts, target_sz, d))
         for i in range(X_.shape[0]):
             if not equal_size:

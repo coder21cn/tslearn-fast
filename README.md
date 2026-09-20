@@ -1,32 +1,80 @@
-<!-- Our logo and description -->
 <div align="center">
-  <p><a href="https://tslearn.readthedocs.io"><image src="https://raw.githubusercontent.com/tslearn-team/tslearn/main/docs/_static/tslearn_logo_white_background.png?cache-control=no-cache" width="20%" alt="tslearn logo"/></a></p>
-  <h1>The machine learning toolkit for time series analysis in Python</h1>
+  <p><a href="https://github.com/tslearn-team/tslearn"><img src="https://raw.githubusercontent.com/tslearn-team/tslearn/main/docs/_static/tslearn_logo_white_background.png?cache-control=no-cache" width="20%" alt="tslearn logo"/></a></p>
+  <h1>tslearn-fast</h1>
+  <p>An unofficial, performance-focused fork of tslearn for time-series machine learning in Python.</p>
 </div>
 
-<!-- The badges -->
 <p align="center">
-    <a href="https://badge.fury.io/py/tslearn">
-        <img alt="PyPI" src="https://badge.fury.io/py/tslearn.svg?cache-control=no-cache">
-    </a>
-    <a href="https://www.python.org/downloads/">
-        <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10+-blue.svg">
-    </a>
-    <a href="http://tslearn.readthedocs.io/en/stable/?badge=stable">
-        <img alt="Documentation" src="https://readthedocs.org/projects/tslearn/badge/?version=stable">
-    </a>
-    <a href="https://dev.azure.com/romaintavenard/tslearn/_build">
-        <img alt="Build (Azure Pipelines)" src="https://dev.azure.com/romaintavenard/tslearn/_apis/build/status/tslearn-team.tslearn?branchName=main">
-    </a>
-    <a href="https://codecov.io/gh/tslearn-team/tslearn">
-        <img alt="Codecov" src="https://codecov.io/gh/tslearn-team/tslearn/branch/main/graph/badge.svg">
-    </a>
-    <a href="https://pepy.tech/project/tslearn">
-        <img alt="Downloads" src="https://pepy.tech/badge/tslearn">
-    </a>
+  <a href="https://www.python.org/downloads/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10+-blue.svg"></a>
+  <a href="https://github.com/tslearn-team/tslearn"><img alt="Upstream tslearn" src="https://img.shields.io/badge/upstream-tslearn-blue"></a>
+  <a href="LICENSE"><img alt="BSD-2-Clause license" src="https://img.shields.io/badge/license-BSD--2--Clause-green.svg"></a>
 </p>
 
-<!-- Draw horizontal rule -->
+> [!IMPORTANT]
+> `tslearn-fast` is an independent fork, not an official release of the
+> [tslearn project](https://github.com/tslearn-team/tslearn). It aims to retain
+> the public tslearn API while accelerating supported NumPy workloads.
+
+## Why tslearn-fast
+
+The fork adds fused or vectorized implementations for performance-sensitive
+operations while retaining upstream-compatible fallbacks for unsupported
+inputs and backends. The main areas include:
+
+- DTW, Soft-DTW, Global Alignment Kernel, and Frechet distance matrices
+- Sakoe-Chiba DTW paths and LB_Keogh-assisted nearest-neighbor search
+- DBA and Soft-DTW barycenters
+- STOMP matrix profiles and selected preprocessing transforms
+- Clustering, nearest-neighbor, and SVM estimator integration
+
+Correctness is covered by parity, regression, serialization, and edge-case
+tests. An ASV benchmark suite is included so results can be measured on your
+own data and hardware; no universal speedup is assumed.
+
+- [Usage guide](USAGE.md)
+- [Performance best practices](BEST_PRACTICES.md)
+- [Benchmark guide](benchmarks/README.md)
+
+## Measured performance
+
+Benchmarked against upstream commit [`99cf640`](https://github.com/tslearn-team/tslearn/commit/99cf640bcc759fdf65dc47ad9c0ec1080768de1e) on an Intel Core i5-11400 using Python 3.13.14, NumPy 2.5.1, and Numba 0.67.0. Values are the median of three runs after JIT warm-up.
+
+| Scenario | Upstream | tslearn-fast | Speedup |
+|---|---:|---:|---:|
+| DTW matrix, `N=100, L=32` | 0.0549s | 0.0073s | **7.48×** |
+| DTW matrix, `N=200, L=64` | 0.4742s | 0.1265s | **3.75×** |
+| Banded DTW, `N=80, L=200` | 0.1591s | 0.0354s | **4.50×** |
+| Multivariate DTW, `N=40, L=400, d=5` | 0.8484s | 0.2560s | **3.31×** |
+| Soft-DTW matrix, `N=100, L=32` | 1.4102s | 0.0476s | **29.61×** |
+| Global Alignment Kernel, `N=100, L=32` | 0.1816s | 0.0395s | **4.59×** |
+| Frechet matrix, `N=100, L=32` | 0.0552s | 0.0103s | **5.37×** |
+| DTW k-neighbors, `200×50, L=64` | 0.1225s | 0.0192s | **6.39×** |
+| DTW k-means, `N=80, L=32, k=4` | 0.1504s | 0.0433s | **3.47×** |
+| Soft-DTW barycenter, `N=20, L=24` | 0.4381s | 0.0293s | **14.97×** |
+| Matrix profile, `L=1000, m=32` | 0.0285s | 0.0017s | **16.82×** |
+
+Observed improvements ranged from **3.31× to 29.61×** for these workloads. Results vary with data shape, hardware, threading, and dependency versions; benchmark your own workload before relying on a specific speedup.
+
+Reproduce the comparison with:
+
+```bash
+python tests/bench_vs_main.py --main-rev 99cf640bcc759fdf65dc47ad9c0ec1080768de1e --repeats 3
+```
+
+See the [usage guide](USAGE.md#measured-speedups-vs-upstream-base) and [benchmark guide](benchmarks/README.md) for details.
+
+## Upstream base and maintenance
+
+The optimized branch is deliberately based on upstream tslearn commit
+[`99cf640`](https://github.com/tslearn-team/tslearn/commit/99cf640bcc759fdf65dc47ad9c0ec1080768de1e),
+the revision against which these changes were developed and tested. It does
+not claim to include later upstream changes. The `upstream` remote can be used
+to evaluate future upgrades separately.
+
+This repository preserves the original BSD-2-Clause license and attribution.
+For the official package, documentation, and support channels, visit
+[tslearn-team/tslearn](https://github.com/tslearn-team/tslearn).
+
 <hr>
 
 <!-- Table of content -->
@@ -41,12 +89,25 @@
 | [Citation](#referencing-tslearn) | A citation for tslearn for scholarly articles |
 
 ## Installation<a id="installation"></a>
-There are different alternatives to install tslearn:
-* PyPi: `python -m pip install tslearn`
-* Conda: `conda install -c conda-forge tslearn`
-* Git: `python -m pip install https://github.com/tslearn-team/tslearn/archive/main.zip`
 
-In order for the installation to be successful, the required dependencies must be installed. For a more detailed guide on how to install tslearn, please see the [Documentation](https://tslearn.readthedocs.io/en/stable/?badge=stable#installation).
+Install the public `main` branch directly from GitHub:
+
+```bash
+python -m pip install "git+https://github.com/coder21cn/tslearn-fast.git@main"
+```
+
+For development, clone the repository and use an editable install:
+
+```bash
+git clone https://github.com/coder21cn/tslearn-fast.git
+cd tslearn-fast
+python -m pip install -e .
+```
+
+The distribution and import name remain `tslearn`, so install this fork in a
+dedicated environment rather than alongside the official PyPI package. If you
+want the official upstream release, use `python -m pip install tslearn` or
+`conda install -c conda-forge tslearn`.
 
 ## Getting started<a id="getting-started"></a>
 
@@ -116,7 +177,7 @@ The documentation is hosted at [readthedocs](http://tslearn.readthedocs.io/en/st
 
 ## Contributing<a id="contributing"></a>
 
-If you would like to contribute to `tslearn`, please have a look at [our contribution guidelines](https://github.com/tslearn-team/tslearn/blob/main/CONTRIBUTING.md). A list of interesting TODO's can be found [here](https://github.com/tslearn-team/tslearn/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20label%3A%22new%20feature%22%20). **If you want other ML methods for time series to be added to this TODO list, do not hesitate to [open an issue](https://github.com/tslearn-team/tslearn/issues/new/choose)!**
+If you would like to contribute to `tslearn`, please have a look at [our contribution guidelines](https://github.com/tslearn-team/tslearn/blob/99cf640bcc759fdf65dc47ad9c0ec1080768de1e/CONTRIBUTING.md). A list of interesting TODO's can be found [here](https://github.com/tslearn-team/tslearn/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20label%3A%22new%20feature%22%20). **If you want other ML methods for time series to be added to this TODO list, do not hesitate to [open an issue](https://github.com/tslearn-team/tslearn/issues/new/choose)!**
 
 ## Referencing tslearn<a id="referencing-tslearn"></a>
 

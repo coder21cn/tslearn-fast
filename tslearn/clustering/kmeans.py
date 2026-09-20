@@ -22,6 +22,8 @@ from tslearn.metrics import (
     _cdist_soft_dtw,
     _sigma_gak as sigma_gak
 )
+from tslearn.metrics._dtw_lb import cdist_dtw_topk_fast
+from tslearn.metrics.utils import _sakoe_radius_for_fast_path, numba_threads_for
 from tslearn.utils import (
     check_array,
     check_dims,
@@ -728,8 +730,31 @@ class TimeSeriesKMeans(
             )
 
     def _assign(self, X, update_class_attributes=True):
-        dists = self._transform(X)
-        matched_labels = dists.argmin(axis=1)
+        # LB_Keogh top-1 fast path for DTW assignment: skips materializing the
+        # full n_X x n_clusters matrix. Falls through to the regular cdist on
+        # multivariate / variable-length / unconstrained inputs, and on
+        # Itakura or ambiguous-constraint inputs (the LB kernel is
+        # Sakoe-Chiba-only).
+        top1_dists = None
+        if self.metric == "dtw":
+            metric_params = self._get_metric_params()
+            radius = _sakoe_radius_for_fast_path(metric_params)
+            if radius is not None:
+                top1 = cdist_dtw_topk_fast(
+                    dataset_query=X,
+                    dataset_candidates=self.cluster_centers_,
+                    k=1,
+                    radius=radius,
+                    n_jobs=self.n_jobs,
+                )
+                if top1 is not None:
+                    top1_dists = top1[0][:, 0]
+                    matched_labels = top1[1][:, 0]
+
+        if top1_dists is None:
+            dists = self._transform(X)
+            matched_labels = dists.argmin(axis=1)
+
         if update_class_attributes:
             self.labels_ = matched_labels
             _check_no_empty_cluster(self.labels_, self.n_clusters)
@@ -737,15 +762,66 @@ class TimeSeriesKMeans(
                 inertia_dists = _cdist_dtw(
                     X, self.cluster_centers_, n_jobs=self.n_jobs, verbose=self.verbose
                 )
+                self.inertia_ = _compute_inertia(
+                    inertia_dists, self.labels_, self._squared_inertia
+                )
+            elif top1_dists is not None:
+                n = top1_dists.shape[0]
+                d = top1_dists ** 2 if self._squared_inertia else top1_dists
+                self.inertia_ = numpy.sum(d) / n
             else:
-                inertia_dists = dists
-            self.inertia_ = _compute_inertia(
-                inertia_dists, self.labels_, self._squared_inertia
-            )
+                self.inertia_ = _compute_inertia(
+                    dists, self.labels_, self._squared_inertia
+                )
         return matched_labels
 
     def _update_centroids(self, X):
         metric_params = self._get_metric_params()
+        # For DTW and Soft-DTW, the per-cluster barycenter call is the heavy
+        # work and is independent across k. When the user opts into multiple
+        # workers, parallelize the outer k-loop with threads (the inner DP
+        # kernels release the GIL). For DTW we fan out to the serial inner
+        # DBA path (n_jobs=1) to avoid nesting joblib pools. Euclidean is a
+        # pure vectorized mean so it stays serial.
+        parallel_metric = self.metric in ("dtw", "softdtw")
+        if (parallel_metric
+                and self.n_jobs not in (None, 1)
+                and self.n_clusters > 1):
+            from joblib import Parallel, delayed
+            # Force numba to one thread inside each outer worker so we don't
+            # spawn ``n_jobs * NUMBA_NUM_THREADS`` OS threads — Soft-DTW
+            # barycenter falls through to ``cdist_soft_dtw`` which threads
+            # the kernel via numba's pool.
+            if self.metric == "softdtw":
+                def _bary_call(X_k, init_k):
+                    return softdtw_barycenter(
+                        X=X_k,
+                        max_iter=self.max_iter_barycenter,
+                        init=init_k,
+                        **metric_params,
+                    )
+            else:
+                def _bary_call(X_k, init_k):
+                    return dtw_barycenter_averaging_petitjean(
+                        X=X_k,
+                        barycenter_size=None,
+                        init_barycenter=init_k,
+                        metric_params=metric_params,
+                        verbose=False,
+                        n_jobs=1,
+                    )
+
+            def _bary_one(k):
+                with numba_threads_for(1):
+                    return _bary_call(
+                        X[self.labels_ == k], self.cluster_centers_[k],
+                    )
+
+            tasks = (delayed(_bary_one)(k) for k in range(self.n_clusters))
+            results = Parallel(n_jobs=self.n_jobs, prefer="threads")(tasks)
+            for k, c in enumerate(results):
+                self.cluster_centers_[k] = c
+            return
         for k in range(self.n_clusters):
             if self.metric == "dtw":
                 self.cluster_centers_[k] = dtw_barycenter_averaging_petitjean(

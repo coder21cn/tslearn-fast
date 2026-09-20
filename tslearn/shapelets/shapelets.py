@@ -49,14 +49,15 @@ __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
 def _kmeans_init_shapelets(X, n_shapelets, shp_len, n_draw=10000):
     n_ts, sz, d = X.shape
     indices_ts = numpy.random.choice(n_ts, size=n_draw, replace=True)
-    indices_time = numpy.array(
-        [numpy.random.choice(_ts_size(ts) - shp_len + 1, size=1)[0]
-         for ts in X[indices_ts]]
+    lens = numpy.fromiter(
+        (_ts_size(X[k]) for k in range(n_ts)), dtype=int, count=n_ts
     )
-    subseries = numpy.zeros((n_draw, shp_len, d))
-    for i in range(n_draw):
-        subseries[i] = X[indices_ts[i],
-                       indices_time[i]:indices_time[i] + shp_len]
+    indices_time = numpy.array(
+        [numpy.random.choice(lens[idx] - shp_len + 1, size=1)[0]
+         for idx in indices_ts]
+    )
+    offsets = indices_time[:, None] + numpy.arange(shp_len)[None, :]
+    subseries = X[indices_ts[:, None], offsets].astype(float)
     return TimeSeriesKMeans(n_clusters=n_shapelets,
                             metric="euclidean",
                             verbose=False).fit(subseries).cluster_centers_

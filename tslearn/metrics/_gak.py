@@ -17,6 +17,28 @@ from tslearn.utils.utils import _to_time_series
 from .utils import _cdist_generic
 
 
+def _normalize_by_inv_sqrt(M, l, r):
+    """Normalize ``M`` by ``l[:, None] * r[None, :]`` for the numpy GAK
+    fast path.
+
+    On non-finite ``l`` or ``r`` the elementwise form leaves cells
+    finite where the *cell* and its scaling factors happen to all be
+    finite (e.g. row 1 of ``[[NaN, NaN], [finite, finite]]``), but
+    main computes the same result via ``diag(l) @ M @ diag(r)``, which
+    propagates ``0 * NaN = NaN`` across every column / row a NaN
+    appears in. Fall back to that BLAS form to match.
+
+    The fast path here only checks ``l`` and ``r`` because
+    ``unnormalized_gak(s, s)`` (the diagonal that ``l``/``r`` divide
+    into) is finite iff ``s`` is — any non-finite cell in ``M`` comes
+    from a non-finite input series, which also poisons that series'
+    self-diagonal and therefore ``l[i]`` or ``r[j]``.
+    """
+    if numpy.isfinite(l).all() and numpy.isfinite(r).all():
+        return M * l[:, None] * r[None, :]
+    return numpy.diag(l) @ M @ numpy.diag(r)
+
+
 def sigma_gak(dataset, n_samples=100, random_state=None, be=None):
     r"""Compute sigma value to be used for GAK.
 
@@ -245,13 +267,24 @@ def unnormalized_gak(s1, s2, sigma=1.0, be=None):
 
 
 def _unnormalized_gak(s1, s2, sigma, backend):
+    if backend.is_numpy and math.isfinite(sigma):
+        # Single-pair via the fused cdist kernel — avoids materializing a
+        # per-pair (sz1, sz2) gram matrix and the cdist/log/exp triplet.
+        # Non-finite sigma falls through to the legacy gram path so the
+        # NaN propagation matches main (the kernel raises instead).
+        from ._gak_fast import cdist_gak_fast
+        return float(
+            cdist_gak_fast(s1[None, ...], s2[None, ...], float(sigma))[0, 0]
+        )
     gram = -backend.cdist(s1, s2, "sqeuclidean") / (2 * sigma * sigma)
     gram -= backend.log(2 - backend.exp(gram))
     gram = backend.exp(gram)
+    # Module-level ``_gak_from_gram_matrix`` is bound to a torch closure
+    # whenever ``HAS_TORCH`` — it can't accept a numpy gram. Dispatch on
+    # the actual backend the caller asked for, matching main.
     if backend.is_numpy:
         return _njit_gak_from_gram_matrix(gram)
-    else:
-        return _gak_from_gram_matrix(gram)
+    return _gak_from_gram_matrix(gram)
 
 
 def __make_gak_from_gram_matrix(backend):
@@ -378,7 +411,8 @@ def _cdist_gak(
     sigma=1.0,
     n_jobs=None,
     verbose=0,
-    be=None
+    be=None,
+    right_inv_sqrt_self=None,
 ):
 
     if math.isclose(sigma, 0.0):
@@ -386,6 +420,30 @@ def _cdist_gak(
 
     if be is None:
        be = instantiate_backend(dataset1, dataset2)
+
+    # Non-finite sigma: the fused kernel's ``1 / (2 * sigma * sigma)`` is
+    # surfaced by numba as a ZeroDivisionError; main propagates NaN
+    # through the per-pair Python loop. Defer to the legacy path so the
+    # output matches.
+    if be.is_numpy and math.isfinite(sigma):
+        from ._gak_fast import cdist_gak_fast, gak_self_diag_fast
+        unnormalized_matrix = cdist_gak_fast(
+            dataset1=dataset1, dataset2=dataset2, sigma=sigma,
+            n_jobs=n_jobs, verbose=verbose,
+        )
+        if dataset2 is None:
+            inv_sqrt = 1.0 / numpy.sqrt(numpy.diag(unnormalized_matrix))
+            return _normalize_by_inv_sqrt(
+                unnormalized_matrix, inv_sqrt, inv_sqrt
+            )
+        left_inv_sqrt = 1.0 / numpy.sqrt(gak_self_diag_fast(dataset1, sigma))
+        if right_inv_sqrt_self is not None:
+            right_inv_sqrt = numpy.asarray(right_inv_sqrt_self)
+        else:
+            right_inv_sqrt = 1.0 / numpy.sqrt(gak_self_diag_fast(dataset2, sigma))
+        return _normalize_by_inv_sqrt(
+            unnormalized_matrix, left_inv_sqrt, right_inv_sqrt
+        )
 
     unnormalized_matrix = _cdist_generic(
        dist_fun=_unnormalized_gak,
@@ -412,16 +470,45 @@ def _cdist_gak(
            )
            for i in range(len(dataset1))
        )
-       diagonal_right = Parallel(n_jobs=n_jobs, prefer="threads", verbose=verbose)(
-           delayed(_unnormalized_gak)(
-               _to_time_series(dataset2[j], remove_nans=True, backend=be),
-               _to_time_series(dataset2[j], remove_nans=True, backend=be),
-               sigma=sigma,
-               backend=be
-           )
-           for j in range(len(dataset2))
-       )
        diagonal_left = be.diag(1.0 / be.sqrt(diagonal_left))
-       diagonal_right = be.diag(1.0 / be.sqrt(diagonal_right))
+       if right_inv_sqrt_self is not None:
+           diagonal_right = be.diag(right_inv_sqrt_self)
+       else:
+           diagonal_right = Parallel(
+               n_jobs=n_jobs, prefer="threads", verbose=verbose
+           )(
+               delayed(_unnormalized_gak)(
+                   _to_time_series(dataset2[j], remove_nans=True, backend=be),
+                   _to_time_series(dataset2[j], remove_nans=True, backend=be),
+                   sigma=sigma,
+                   backend=be
+               )
+               for j in range(len(dataset2))
+           )
+           diagonal_right = be.diag(1.0 / be.sqrt(diagonal_right))
 
     return diagonal_left @ unnormalized_matrix @ diagonal_right
+
+
+def _gak_self_inv_sqrt_diag(dataset, sigma, n_jobs=None, verbose=0, be=None):
+    """Returns ``1 / sqrt(K(X[i], X[i], sigma))`` for each i — the
+    right-side normalization vector reused across `cdist_gak` calls in
+    fit/predict workflows."""
+    if math.isclose(sigma, 0.0):
+        # ``inv_2sigma2`` diverges to inf inside the fast-path kernel and
+        # silently propagates as NaN out of the ``1/sqrt(0)`` step here.
+        raise ZeroDivisionError("Sigma must be non-zero.")
+    be = instantiate_backend(be, dataset)
+    if be.is_numpy and math.isfinite(sigma):
+        from ._gak_fast import gak_self_diag_fast
+        return 1.0 / be.sqrt(gak_self_diag_fast(dataset, sigma))
+    diag = Parallel(n_jobs=n_jobs, prefer="threads", verbose=verbose)(
+        delayed(_unnormalized_gak)(
+            _to_time_series(dataset[j], remove_nans=True, backend=be),
+            _to_time_series(dataset[j], remove_nans=True, backend=be),
+            sigma=sigma,
+            backend=be,
+        )
+        for j in range(len(dataset))
+    )
+    return 1.0 / be.sqrt(be.array(diag))
