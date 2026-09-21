@@ -4,7 +4,10 @@ from contextlib import contextmanager
 
 from joblib import Parallel, delayed, effective_n_jobs
 
-from numba import njit, config as _numba_config, get_num_threads, set_num_threads
+from numba import (
+    njit, config as _numba_config, get_num_threads, set_num_threads,
+    threading_layer,
+)
 
 import numpy
 
@@ -81,16 +84,18 @@ __author__ = "Romain Tavenard romain.tavenard[at]univ-rennes2.fr"
 
 
 def _is_int_valued_finite(value) -> bool:
-    """True iff ``value`` coerces to a finite, integer-valued float.
+    """Whether ``value`` is a finite integer safe for band-kernel indices.
 
     Used to gate fast-path Sakoe-radius kernels (which need ``int`` for
     ``range(...)`` bounds) against public API inputs main accepts but
     can't be safely truncated — fractional radii change the mask, and
-    NaN/Inf raise on ``int(...)``. When this returns False, callers
-    should defer to the legacy mask-based path.
+    NaN/Inf raise on ``int(...)``. Huge finite radii can also overflow
+    Numba's int64 arguments or the subsequent band-bound additions.
+    When this returns False, callers should defer to the legacy mask path.
     """
     f = float(value)
-    return numpy.isfinite(f) and f.is_integer()
+    # Keep headroom for adding series lengths to the signed int64 radius.
+    return numpy.isfinite(f) and f.is_integer() and abs(f) < 2 ** 62
 
 
 def _resolve_n_jobs(n_jobs):
@@ -180,6 +185,12 @@ def _sakoe_radius_for_fast_path(metric_params):
     path — main accepts these (the mask handles them) but the int-bound
     ``range(...)`` kernels these fast paths feed into can't.
     """
+    # The shortcut consumes only these parameters. Let the regular caller
+    # handle any others instead of silently ignoring them (including typos).
+    if metric_params.keys() - {
+        "global_constraint", "sakoe_chiba_radius", "itakura_max_slope",
+    }:
+        return None
     radius = metric_params.get("sakoe_chiba_radius")
     if radius is None or radius < 0:
         return None
@@ -222,12 +233,26 @@ def _is_sakoe_chiba_only(global_constraint, sakoe_chiba_radius,
         return False
     if code == GLOBAL_CONSTRAINT_CODE["sakoe_chiba"]:
         return sakoe_chiba_radius is not None
+    if code != GLOBAL_CONSTRAINT_CODE[None]:
+        # Unknown names must reach the caller's regular validation path.
+        return False
     # No explicit named constraint: only safe when a Sakoe radius is set
     # AND no Itakura slope is set (otherwise the combination is ambiguous
     # and the slow path raises).
     if sakoe_chiba_radius is None:
         return False
     return itakura_max_slope is None
+
+
+def _numba_allows_concurrent_calls():
+    """Whether parallel kernels can run from multiple Python threads."""
+    # Public dispatchers use their legacy paths on workqueue so concurrent
+    # callers cannot turn a regular API call into a process-wide abort.
+    # Initialize before querying the actual selected layer, including when
+    # Numba chooses workqueue automatically. Even one-thread launches abort
+    # under workqueue if another Python thread is already using the pool.
+    get_num_threads()
+    return threading_layer() != "workqueue"
 
 
 @contextmanager

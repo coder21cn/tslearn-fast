@@ -120,6 +120,29 @@ def test_k_neighbors_classifier():
     np.testing.assert_array_less(sax_dist[:, 1:], euc_dist[:, 1:])
 
 
+@pytest.mark.parametrize("n_neighbors", [1, 3, 5])
+def test_dtw_kneighbors_returns_valid_indices_on_overflow(n_neighbors):
+    from tslearn.metrics import cdist_dtw
+
+    X_fit = np.array([[0., 0.], [1e154, 1e154], [-1e154, -1e154]])[..., None]
+    X_query = np.array([[0., 0.], [3e154, 3e154]])[..., None]
+    model = KNeighborsTimeSeries(
+        n_neighbors=n_neighbors, metric="dtw",
+        metric_params={"sakoe_chiba_radius": 1},
+    ).fit(X_fit)
+    dists, idxs = model.kneighbors(X_query)
+    k = min(n_neighbors, len(X_fit))
+    assert idxs.shape == (len(X_query), k)
+    assert ((idxs >= 0) & (idxs < len(X_fit))).all()
+    assert all(len(np.unique(row)) == k for row in idxs)
+    full = cdist_dtw(X_query, X_fit, sakoe_chiba_radius=1)
+    np.testing.assert_array_equal(dists, np.sort(full, axis=1)[:, :k])
+    np.testing.assert_array_equal(dists, np.take_along_axis(full, idxs, axis=1))
+    np.testing.assert_array_equal(
+        model.kneighbors(X_query, return_distance=False), idxs,
+    )
+
+
 def test_dtw_kneighbors_clamps_k_to_fitted_population():
     # Regression: when n_neighbors > n_fit, the DTW LB-prune fast path
     # used to return padded -1 indices and +inf distances. It must

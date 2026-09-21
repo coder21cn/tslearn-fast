@@ -23,6 +23,7 @@ from tslearn.metrics import (
     cdist_frechet,
     cdist_gak,
     cdist_soft_dtw,
+    dtw,
     dtw_path,
     frechet,
     gak,
@@ -82,6 +83,104 @@ def _slow_cdist_dtw(X, Y, **mp):
 
 
 # ------------------------------ cdist_dtw -----------------------------------
+
+
+@pytest.mark.parametrize("radius", [-1, -2, -10])
+def test_negative_radius_single_pair_uses_safe_fallback(radius, monkeypatch):
+    from tslearn.metrics import _dtw as dtw_module
+
+    def unsafe_kernel(*args, **kwargs):
+        pytest.fail("Negative radius reached an unchecked band kernel")
+
+    # Prevent native memory corruption if dispatch regresses in the future.
+    monkeypatch.setattr(dtw_module, "_njit_dtw_sakoe", unsafe_kernel)
+    monkeypatch.setattr(dtw_module, "_njit_dtw_path_sakoe", unsafe_kernel)
+    x = np.arange(4., dtype=float)[:, None]
+    expected = _njit_dtw(x, x, sakoe_chiba_radius=radius)
+    assert dtw(x, x, sakoe_chiba_radius=radius) == expected
+    expected_dist, expected_path = _njit_dtw_path(
+        x, x, sakoe_chiba_radius=radius
+    )
+    path, dist = dtw_path(x, x, sakoe_chiba_radius=radius)
+    assert dist == expected_dist
+    assert path == expected_path
+
+
+@pytest.mark.parametrize("radius", [-1, -2, -10])
+@pytest.mark.parametrize("self_similarity", [False, True])
+@pytest.mark.parametrize("metric", ["dtw", "frechet"])
+def test_negative_radius_cdist_uses_safe_fallback(
+    radius, self_similarity, metric, monkeypatch
+):
+    from tslearn.metrics import _dtw_fast, _frechet_fast
+
+    def unsafe_kernel(*args, **kwargs):
+        pytest.fail("Negative radius reached an unchecked band kernel")
+
+    module = _dtw_fast if metric == "dtw" else _frechet_fast
+    for kind in ["", "self_"]:
+        monkeypatch.setattr(
+            module, f"_njit_cdist_{metric}_{kind}sakoe_chiba", unsafe_kernel
+        )
+    X = np.arange(8., dtype=float).reshape(2, 4, 1)
+    Y = None if self_similarity else X.copy()
+    public = cdist_dtw if metric == "dtw" else cdist_frechet
+    reference = _njit_dtw if metric == "dtw" else _njit_frechet
+    actual = public(X, Y, sakoe_chiba_radius=radius)
+    expected = _cdist_generic(
+        dist_fun=reference, dataset1=X, dataset2=Y, be=NUMPY_BE,
+        n_jobs=None, verbose=0, compute_diagonal=False,
+        sakoe_chiba_radius=radius,
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("radius", [float(2 ** 62), 1e19, 1e20])
+@pytest.mark.parametrize("operation", [
+    "dtw", "dtw_path", "cdist_dtw", "cdist_frechet",
+    "neighbors", "kmeans", "dba_mm", "dba_petitjean",
+])
+def test_large_sakoe_radius_preserves_unconstrained_result(radius, operation):
+    from tslearn.barycenters import (
+        dtw_barycenter_averaging, dtw_barycenter_averaging_petitjean,
+    )
+    from tslearn.clustering import TimeSeriesKMeans
+    from tslearn.neighbors import KNeighborsTimeSeries
+
+    X = np.random.RandomState(3).randn(5, 7, 1)
+
+    def calculate(r):
+        params = {"sakoe_chiba_radius": r}
+        if operation == "dtw":
+            return dtw(X[0], X[1], **params)
+        if operation == "dtw_path":
+            path, distance = dtw_path(X[0], X[1], **params)
+            return np.asarray(path), distance
+        if operation in ("cdist_dtw", "cdist_frechet"):
+            metric = cdist_dtw if operation == "cdist_dtw" else cdist_frechet
+            return metric(X, X[:2], **params)
+        if operation == "neighbors":
+            return KNeighborsTimeSeries(
+                n_neighbors=2, metric="dtw", metric_params=params,
+            ).fit(X).kneighbors(X[:2])
+        if operation == "kmeans":
+            model = TimeSeriesKMeans(
+                n_clusters=2, metric="dtw", metric_params=params,
+                init=X[:2], max_iter=1,
+            ).fit(X)
+            return model.labels_, model.cluster_centers_, model.inertia_
+        barycenter = (dtw_barycenter_averaging if operation == "dba_mm"
+                      else dtw_barycenter_averaging_petitjean)
+        return barycenter(X, max_iter=1, metric_params=params)
+
+    # Both radii cover the entire alignment grid. The large float must not
+    # overflow when a shortcut converts it to a native integer.
+    expected = calculate(1000)
+    actual = calculate(radius)
+    if not isinstance(expected, tuple):
+        expected, actual = (expected,), (actual,)
+    for got, reference in zip(actual, expected):
+        np.testing.assert_allclose(got, reference, rtol=1e-7, atol=ATOL)
 
 
 @pytest.mark.parametrize("d", [1, 5])
@@ -244,6 +343,23 @@ def test_cdist_dtw_topk_declines_when_inputs_unsupported():
     assert cdist_dtw_topk_fast(Z, Z, k=2, radius=None) is None
 
 
+@pytest.mark.parametrize("k", [1, 3, 5])
+def test_cdist_dtw_topk_falls_back_on_distance_overflow(k):
+    Y = np.array([[0., 0.], [1e154, 1e154], [-1e154, -1e154]])[..., None]
+    X = np.array([[0., 0.], [3e154, 3e154]])[..., None]
+    # Finite inputs can still overflow the squared distances. The second
+    # query has no finite neighbor; do not expose unfilled -1 indices.
+    assert cdist_dtw_topk_fast(X, Y, k=k, radius=1) is None
+
+
+def test_cdist_dtw_topk_keeps_finite_neighbors_despite_overflow():
+    Y = np.array([[0., 0.], [1e154, 1e154], [-1e154, -1e154]])[..., None]
+    fast = cdist_dtw_topk_fast(Y[:1], Y, k=1, radius=1)
+    assert fast is not None
+    np.testing.assert_array_equal(fast[0], [[0.]])
+    np.testing.assert_array_equal(fast[1], [[0]])
+
+
 def test_cdist_dtw_topk_empty_query_and_oversize_k():
     # Empty query → output shapes propagate; dtypes match the kernel contract.
     Y = np.random.RandomState(6).randn(5, 12, 1).astype(np.float64)
@@ -336,6 +452,136 @@ def test_cdist_gak_parity(d, self_sim):
         for j in range(n2):
             slow[i, j] = gak(X[i], Y_ref[j], sigma=sigma)
     np.testing.assert_allclose(fast, slow, atol=ATOL)
+
+
+@pytest.mark.parametrize("sigma", [1e-153, 1e-154, 5.273843307431501e-155,
+                                   1e-155, -1e-155])
+def test_gak_small_bandwidth_preserves_scale_invariance(sigma):
+    from tslearn.metrics import unnormalized_gak
+    from tslearn.metrics._gak import _cdist_gak, _gak_self_inv_sqrt_diag
+
+    x = np.array([0., 1., 2.])
+    y = np.array([1., 2., 3.])
+    scale = abs(sigma)
+    # Scaling both the samples and bandwidth must leave GAK unchanged.
+    # A representable 2*sigma**2 can still have an infinite reciprocal.
+    np.testing.assert_allclose(gak(x * scale, x * scale, sigma=sigma), 1.)
+    np.testing.assert_allclose(
+        gak(x * scale, y * scale, sigma=sigma), gak(x, y),
+    )
+    np.testing.assert_allclose(
+        unnormalized_gak(x * scale, y * scale, sigma=sigma),
+        unnormalized_gak(x, y),
+    )
+    X = to_time_series_dataset([x, y[:2]])
+    Y = to_time_series_dataset([y, x[:2]])
+    np.testing.assert_allclose(cdist_gak(X * scale, sigma=sigma), cdist_gak(X))
+    expected = cdist_gak(X, Y)
+    np.testing.assert_allclose(cdist_gak(X * scale, Y * scale, sigma=sigma), expected)
+    # The SVM normalization cache must use the same safe dispatch.
+    right_diag = _gak_self_inv_sqrt_diag(Y * scale, sigma=sigma)
+    np.testing.assert_allclose(right_diag, _gak_self_inv_sqrt_diag(Y, sigma=1.))
+    np.testing.assert_allclose(
+        _cdist_gak(X * scale, Y * scale, sigma=sigma,
+                   right_inv_sqrt_self=right_diag), expected,
+    )
+
+
+@pytest.mark.parametrize("operation", [
+    "gak", "cdist_dtw", "cdist_frechet", "cdist_gak", "soft_dtw",
+    "barycenter", "matrix_profile", "neighbors", "kmeans", "svm",
+])
+def test_concurrent_calls_under_workqueue(operation):
+    # Backend selection and any native abort must stay outside pytest's
+    # process. Public APIs must remain safe in Python worker threads.
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        import importlib
+        import sys
+        import numpy as np
+        from numba import threading_layer
+        from tslearn.metrics import (
+            gak, unnormalized_gak, cdist_dtw, cdist_frechet, cdist_gak,
+            cdist_soft_dtw_normalized,
+        )
+        from tslearn.barycenters import softdtw_barycenter
+        from tslearn.clustering import TimeSeriesKMeans
+        from tslearn.matrix_profile import MatrixProfile
+        from tslearn.neighbors import KNeighborsTimeSeries
+        from tslearn.svm import TimeSeriesSVR
+
+        x = np.linspace(0., 1., 128)
+        y = np.linspace(0., 2., 128)
+        X = np.random.RandomState(3).randn(4, 16, 1)
+        operations = {
+            'gak': lambda: [gak(x, y), unnormalized_gak(x, y)],
+            'cdist_dtw': lambda: cdist_dtw(X, X),
+            'cdist_frechet': lambda: cdist_frechet(X, X),
+            'cdist_gak': lambda: cdist_gak(X, X),
+            'soft_dtw': lambda: cdist_soft_dtw_normalized(X, X),
+            'barycenter': lambda: softdtw_barycenter(X, max_iter=2),
+            'matrix_profile': lambda: MatrixProfile(
+                subsequence_length=4, scale=False).fit_transform(X),
+            'neighbors': lambda: KNeighborsTimeSeries(
+                n_neighbors=2, metric='dtw',
+                metric_params={'sakoe_chiba_radius': 2},
+            ).fit(X).kneighbors(X),
+            'kmeans': lambda: TimeSeriesKMeans(
+                n_clusters=2, metric='dtw', max_iter=2, n_jobs=2,
+                init=X[:2].copy(), metric_params={'sakoe_chiba_radius': 2},
+                random_state=0,
+            ).fit(X).cluster_centers_,
+            'svm': lambda: TimeSeriesSVR(gamma=2.).fit(
+                X, np.arange(len(X), dtype=float)).predict(X),
+        }
+        call = operations[sys.argv[1]]
+        expected = call()
+        assert threading_layer() == 'workqueue'
+
+        def unsafe_parallel_launch(*args, **kwargs):
+            raise AssertionError('Parallel fast path entered under workqueue')
+
+        # Fail safely and deterministically if dispatch regresses; actual
+        # concurrent calls below still exercise the real legacy fallback.
+        for name in ('metrics._dtw_fast', 'metrics._frechet_fast',
+                     'metrics._gak_fast', 'metrics._softdtw_fast',
+                     'metrics._dtw_lb', 'matrix_profile._mp_fast'):
+            module = importlib.import_module('tslearn.' + name)
+            for attr, value in list(vars(module).items()):
+                if getattr(value, 'targetoptions', {}).get('parallel'):
+                    setattr(module, attr, unsafe_parallel_launch)
+        barrier = Barrier(2)
+
+        def call_pair(_):
+            barrier.wait(timeout=10)
+            return call()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for result in pool.map(call_pair, range(2)):
+                np.testing.assert_allclose(result, expected, rtol=1e-12)
+    """)
+    env = dict(os.environ, NUMBA_THREADING_LAYER="workqueue",
+               NUMBA_NUM_THREADS="2", OMP_NUM_THREADS="2")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script, operation],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    print(f"{operation} workqueue regression worker PID={proc.pid}", flush=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        pytest.fail(f"Worker {proc.pid} timed out: {stdout}\n{stderr}")
+    assert proc.returncode == 0, f"Worker {proc.pid}: {stdout}\n{stderr}"
 
 
 def test_cdist_gak_preserves_nan_normalization():
@@ -451,6 +697,55 @@ def test_is_sakoe_chiba_only_predicate():
     assert _is_sakoe_chiba_only(2, 3, None)            # SAKOE_CHIBA
     assert not _is_sakoe_chiba_only(1, 3, None)        # ITAKURA
     assert _is_sakoe_chiba_only(0, 3, None)            # NO_CONSTRAINT
+
+    assert not _is_sakoe_chiba_only("unknown", 3, None)
+    assert not _is_sakoe_chiba_only(3, 3, None)
+
+
+@pytest.mark.parametrize("estimator", ["neighbors", "kmeans"])
+def test_dtw_estimators_reject_unknown_constraint(estimator):
+    from tslearn.clustering import TimeSeriesKMeans
+    from tslearn.neighbors import KNeighborsTimeSeries
+
+    X = np.random.RandomState(1).randn(4, 8, 1)
+    metric_params = {"global_constraint": "unknown", "sakoe_chiba_radius": 2}
+    with pytest.raises(KeyError, match="unknown"):
+        if estimator == "neighbors":
+            KNeighborsTimeSeries(
+                n_neighbors=1, metric="dtw", metric_params=metric_params,
+            ).fit(X).kneighbors(X[:1])
+        else:
+            TimeSeriesKMeans(
+                n_clusters=2, metric="dtw", metric_params=metric_params,
+                init=X[:2], max_iter=1,
+            ).fit(X)
+
+
+@pytest.mark.parametrize("operation", ["neighbors", "kmeans", "dba_mm", "dba_petitjean"])
+@pytest.mark.parametrize("extra_param", ["gamma", "sakoe_chiba_raduis"])
+def test_dtw_fast_paths_reject_unsupported_metric_params(operation, extra_param):
+    from tslearn.barycenters import (
+        dtw_barycenter_averaging, dtw_barycenter_averaging_petitjean,
+    )
+    from tslearn.clustering import TimeSeriesKMeans
+    from tslearn.neighbors import KNeighborsTimeSeries
+
+    X = np.random.RandomState(1).randn(4, 8, 1)
+    params = {"sakoe_chiba_radius": 2, extra_param: 1.0}
+    with pytest.raises(TypeError, match="unexpected"):
+        if operation == "neighbors":
+            KNeighborsTimeSeries(
+                n_neighbors=1, metric="dtw", metric_params=params,
+            ).fit(X).kneighbors(X[:1])
+        elif operation == "kmeans":
+            TimeSeriesKMeans(
+                n_clusters=2, metric="dtw", metric_params=params,
+                init=X[:2], max_iter=1,
+            ).fit(X)
+        else:
+            barycenter = (dtw_barycenter_averaging if operation == "dba_mm"
+                          else dtw_barycenter_averaging_petitjean)
+            barycenter(X, max_iter=1, metric_params=params)
 
 
 def test_dtw_kneighbors_falls_through_for_ambiguous_constraint():
@@ -674,6 +969,65 @@ def test_softdtw_barycenter_rejects_non_finite_inputs():
     bad_init = np.array([[np.nan]], dtype=np.float64)
     with pytest.raises(ValueError):
         softdtw_barycenter([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]], init=bad_init)
+
+
+@pytest.mark.parametrize("data_dim,init_dim", [(1, 2), (2, 1), (2, 3)])
+def test_softdtw_barycenter_rejects_mismatched_init_features(data_dim, init_dim):
+    from tslearn.barycenters import softdtw_barycenter
+
+    X = np.random.RandomState(0).randn(2, 3, data_dim)
+    init = np.zeros((3, init_dim))
+    with pytest.raises(ValueError, match="Incompatible dimension"):
+        softdtw_barycenter(X, init=init, max_iter=2)
+    # A zero-iteration call still returns init without optimizing, as upstream.
+    np.testing.assert_array_equal(
+        softdtw_barycenter(X, init=init, max_iter=0), init
+    )
+
+
+@pytest.mark.parametrize("offset", [1e12, 1e15])
+@pytest.mark.parametrize("d", [1, 3])
+def test_softdtw_gradient_constant_large_offset(offset, d):
+    from tslearn.metrics._softdtw_fast import softdtw_obj_grad_fast
+
+    X = np.full((2, 5, d), offset)
+    _, gradient = softdtw_obj_grad_fast(
+        X[0].copy(), X, np.array([5, 5]), np.ones(2), 1.0
+    )
+    # Identical constant series are stationary, regardless of their offset.
+    np.testing.assert_array_equal(gradient, np.zeros((5, d)))
+
+
+@pytest.mark.parametrize("offset", [1e12, 1e15])
+@pytest.mark.parametrize("d", [1, 3])
+@pytest.mark.parametrize("gamma", [0.25, 2.0])
+def test_softdtw_gradient_translation_invariance(offset, d, gamma):
+    from tslearn.metrics._softdtw_fast import softdtw_obj_grad_fast
+
+    rng = np.random.RandomState(42)
+    # Quarter-integer values remain exactly representable after translation,
+    # so this checks the gradient arithmetic, not input rounding.
+    X = rng.randint(-4, 5, size=(3, 7, d)).astype(float) / 4
+    Z = rng.randint(-4, 5, size=(4, d)).astype(float) / 4
+    lengths = np.array([3, 5, 7])
+    weights = np.array([0.25, 0.5, 1.25])
+    expected_obj, expected_grad = softdtw_obj_grad_fast(
+        Z, X, lengths, weights, gamma
+    )
+    actual_obj, actual_grad = softdtw_obj_grad_fast(
+        Z + offset, X + offset, lengths, weights, gamma
+    )
+    np.testing.assert_allclose(actual_obj, expected_obj, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(actual_grad, expected_grad, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("gamma", [-1.0, 1e-300])
+def test_softdtw_barycenter_rejects_nonfinite_optimizer_iterate(gamma):
+    from tslearn.barycenters import softdtw_barycenter
+
+    X = np.random.RandomState(3).randn(5, 7, 1)
+    with pytest.raises(ValueError, match="NaN"):
+        softdtw_barycenter(X, gamma=gamma, max_iter=1)
 
 
 def test_softdtw_barycenter_gamma_zero_uses_legacy_error():
@@ -901,6 +1255,20 @@ def test_cdist_soft_dtw_normalized_validates_non_empty_side():
         cdist_soft_dtw_normalized(invalid, empty_left)
 
 
+@pytest.mark.parametrize("n", [18, 50])
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("amplitude", [1.0, 1e12])
+def test_resampler_preserves_exact_grid_samples(n, stride, amplitude):
+    from tslearn.preprocessing import TimeSeriesResampler
+
+    x = (np.arange(n) % 2) * amplitude
+    target = stride * (n - 1) + 1
+    actual = TimeSeriesResampler(sz=target).fit_transform(x[None, :, None])[0, :, 0]
+    expected = np.interp(np.linspace(0, 1, target), np.linspace(0, 1, n), x)
+    np.testing.assert_array_equal(actual[::stride], x)
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+
+
 def test_resampler_preserves_interp_nan_behavior():
     # Regression: the equal-length vectorized resampler computed both
     # bracketing samples with weights w0/w1; when frac is 0 (exact-grid
@@ -1034,6 +1402,29 @@ def test_dba_path_dispatch_normalizes_explicit_none_constraint():
         )
 
 
+@pytest.mark.parametrize("m,scale", [(0, False), (0, True), (9, True)])
+@pytest.mark.parametrize("fit_separately", [False, True])
+def test_matrix_profile_preserves_invalid_window_errors(m, scale, fit_separately):
+    X = np.random.RandomState(2027).randn(2, 8, 1)
+    model = MatrixProfile(subsequence_length=m, scale=scale)
+    with pytest.raises(ValueError):
+        if fit_separately:
+            model.fit(X).transform(X)
+        else:
+            model.fit_transform(X)
+
+
+@pytest.mark.parametrize("fit_separately", [False, True])
+def test_matrix_profile_preserves_unscaled_empty_result(fit_separately):
+    # Upstream accepts this empty result without scaling. Do not introduce
+    # broader parameter validation while restoring the scaled-path error.
+    X = np.random.RandomState(2027).randn(2, 8, 1)
+    model = MatrixProfile(subsequence_length=9, scale=False)
+    actual = (model.fit(X).transform(X) if fit_separately
+              else model.fit_transform(X))
+    assert actual.shape == (2, 0, 1)
+
+
 @pytest.mark.parametrize("scale", [False, True])
 def test_stomp_matrix_profile_parity(scale):
     rng = np.random.RandomState(11)
@@ -1046,6 +1437,91 @@ def test_stomp_matrix_profile_parity(scale):
     )[0, :, 0]
     slow = _naive_matrix_profile(x, m, scale, band)
     np.testing.assert_allclose(fast, slow, atol=ATOL)
+
+
+@pytest.mark.parametrize("offset", [-1e8, 1e8])
+def test_matrix_profile_large_offset_unscaled(offset):
+    x = (offset + np.random.RandomState(1).randn(32))[:, None]
+    mp = MatrixProfile(subsequence_length=4, scale=False)
+    assert not mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    expected = _naive_matrix_profile(x, 4, False, 1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+
+
+@pytest.mark.parametrize("amplitude,noise", [
+    (1e3, 1e-4), (1e4, 1e-4), (1e8, 1.0), (1e4, 0.0),
+])
+@pytest.mark.parametrize("m", [4, 8])
+@pytest.mark.parametrize("scale", [False, True])
+def test_matrix_profile_near_repeated(amplitude, noise, m, scale):
+    x = (amplitude * (-1.) ** np.arange(32)
+         + noise * np.random.RandomState(1).randn(32))[:, None]
+    mp = MatrixProfile(subsequence_length=m, scale=scale)
+    # These zero-mean windows pass the guard for large DC offsets.
+    assert mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    expected = _naive_matrix_profile(x, m, scale, int(np.ceil(m / 4)))
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+    if noise:
+        assert np.all(actual > 0)
+
+
+@pytest.mark.parametrize("amplitude", [1e-13, 1e-12])
+def test_matrix_profile_small_amplitude_scaled(amplitude):
+    x = (amplitude * np.random.RandomState(1).randn(32))[:, None]
+    mp = MatrixProfile(subsequence_length=4, scale=True)
+    assert not mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    expected = _naive_matrix_profile(x, 4, True, 1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+    assert np.all(actual > 0)
+
+
+@pytest.mark.parametrize("m", [4, 8])
+@pytest.mark.parametrize("offset", [40., -40., "piecewise"])
+def test_matrix_profile_noisy_repeats_with_offset(m, offset):
+    x = ((-1.) ** np.arange(2048)
+         + .001 * np.random.RandomState(1).randn(2048))
+    if offset == "piecewise":
+        x[1024:] += 40.
+    else:
+        x += offset
+    x = x[:, None]
+    mp = MatrixProfile(subsequence_length=m, scale=True)
+    assert mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    # The pdist fallback is the upstream calculation, without an O(n**2)
+    # Python loop for this longer regression signal.
+    expected = mp._numpy_pdist_matrix_profile(x, int(np.ceil(m / 4)))[:, 0]
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+
+
+@pytest.mark.parametrize("scale,m,seed", [(False, 2, 0), (True, 3, 34)])
+def test_matrix_profile_recurrence_roundoff_near_matches(scale, m, seed):
+    rng = np.random.RandomState(seed)
+    x = rng.randn(512)
+    if not scale:
+        x = np.resize(rng.randn(8), 512) + rng.randn(512) * 1e-4
+    x = (x * 1e10)[:, None]
+    mp = MatrixProfile(subsequence_length=m, scale=scale)
+    assert mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    expected = mp._numpy_pdist_matrix_profile(x, int(np.ceil(m / 4)))[:, 0]
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
+
+
+@pytest.mark.parametrize("amplitude", [1e3, 1e4, 1e6])
+@pytest.mark.parametrize("scale", [False, True])
+@pytest.mark.parametrize("m", [4, 8])
+def test_matrix_profile_drop_in_window_energy(amplitude, scale, m):
+    x = np.random.RandomState(128).randn(128, 1)
+    x[:64] *= amplitude
+    mp = MatrixProfile(subsequence_length=m, scale=scale)
+    assert not mp._stomp_safe(x)
+    actual = mp.fit_transform(x[None, :, :])[0, :, 0]
+    expected = _naive_matrix_profile(x, m, scale, int(np.ceil(m / 4)))
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=ATOL)
 
 
 def test_stomp_matrix_profile_rejects_multivariate_for_main_parity():

@@ -37,31 +37,52 @@ own data and hardware; no universal speedup is assumed.
 
 ## Measured performance
 
-Benchmarked against upstream commit [`99cf640`](https://github.com/tslearn-team/tslearn/commit/99cf640bcc759fdf65dc47ad9c0ec1080768de1e) on an Intel Core i5-11400 using Python 3.13.14, NumPy 2.5.1, and Numba 0.67.0. Values are the median of three runs after JIT warm-up.
+Benchmarked on 2026-09-21 against upstream commit
+[`99cf640`](https://github.com/tslearn-team/tslearn/commit/99cf640bcc759fdf65dc47ad9c0ec1080768de1e)
+on an Intel Core i5-11400 using Windows 11, Python 3.13.14, NumPy 2.5.1,
+and Numba 0.67.0 with OpenMP. Values are the median of five runs after one
+untimed JIT warm-up, using identical inputs and thread limits for both versions.
 
-| Scenario | Upstream | tslearn-fast | Speedup |
-|---|---:|---:|---:|
-| DTW matrix, `N=100, L=32` | 0.0549s | 0.0073s | **7.48×** |
-| DTW matrix, `N=200, L=64` | 0.4742s | 0.1265s | **3.75×** |
-| Banded DTW, `N=80, L=200` | 0.1591s | 0.0354s | **4.50×** |
-| Multivariate DTW, `N=40, L=400, d=5` | 0.8484s | 0.2560s | **3.31×** |
-| Soft-DTW matrix, `N=100, L=32` | 1.4102s | 0.0476s | **29.61×** |
-| Global Alignment Kernel, `N=100, L=32` | 0.1816s | 0.0395s | **4.59×** |
-| Frechet matrix, `N=100, L=32` | 0.0552s | 0.0103s | **5.37×** |
-| DTW k-neighbors, `200×50, L=64` | 0.1225s | 0.0192s | **6.39×** |
-| DTW k-means, `N=80, L=32, k=4` | 0.1504s | 0.0433s | **3.47×** |
-| Soft-DTW barycenter, `N=20, L=24` | 0.4381s | 0.0293s | **14.97×** |
-| Matrix profile, `L=1000, m=32` | 0.0285s | 0.0017s | **16.82×** |
+| Scenario | Upstream (ms, 1 thread) | tslearn-fast (ms, 1 thread) | Speedup (1 thread) | Speedup (2-thread cap) |
+|---|---:|---:|---:|---:|
+| DTW matrix, `N=100, L=32` | 56.016 | 7.438 | 7.53× | 7.90× |
+| DTW matrix, `N=200, L=64` | 487.905 | 117.762 | 4.14× | 4.18× |
+| Banded DTW, `N=80, L=200` | 161.027 | 34.846 | 4.62× | 4.62× |
+| Multivariate DTW, `N=40, L=400, d=5` | 794.707 | 248.753 | 3.19× | 3.22× |
+| Soft-DTW matrix, `N=100, L=32` | 1420.777 | 216.345 | 6.57× | 8.62× |
+| Global Alignment Kernel, `N=100, L=32` | 186.412 | 36.425 | 5.12× | 5.09× |
+| Frechet matrix, `N=100, L=32` | 54.708 | 10.008 | 5.47× | 5.39× |
+| DTW k-neighbors, `200×50, L=64` | 122.428 | 16.502 | 7.42× | 7.46× |
+| DTW k-means, `N=80, L=32, k=4` | 148.621 | 42.900 | 3.46× | 3.37× |
+| Soft-DTW barycenter, `N=20, L=24` | 244.235 | 24.064 | 10.15× | 12.24× |
+| Matrix profile, `L=1000, m=32` | 28.830 | 4.027 | 7.16× | 9.96× |
 
-Observed improvements ranged from **3.31× to 29.61×** for these workloads. Results vary with data shape, hardware, threading, and dependency versions; benchmark your own workload before relying on a specific speedup.
+Observed speedups ranged from **3.19× to 10.15×** with a one-thread limit and
+**3.22× to 12.24×** with a two-thread limit. Absolute timings above use the
+one-thread limit; the last column is a separate two-thread-limit comparison.
+All 22 benchmark-output comparisons matched within `rtol=1e-7, atol=1e-9`.
 
-Reproduce the comparison with:
+Thread limits cap Numba, OpenMP, and BLAS pools; they do not force each algorithm
+to use that many threads. Default API `n_jobs` settings were preserved.
+These are warm-run results for the listed synthetic workloads, not universal
+speedup guarantees. Startup costs and numerical edge cases that select slower
+fallbacks are not represented.
 
-```bash
-python tests/bench_vs_main.py --main-rev 99cf640bcc759fdf65dc47ad9c0ec1080768de1e --repeats 3
+Reproduce the one-thread comparison from the repository root in PowerShell:
+
+```powershell
+$env:NUMBA_NUM_THREADS = "1"
+$env:OMP_NUM_THREADS = "1"
+$env:OPENBLAS_NUM_THREADS = "1"
+$env:MKL_NUM_THREADS = "1"
+$env:NUMEXPR_NUM_THREADS = "1"
+python tests/bench_vs_main.py --main-rev 99cf640bcc759fdf65dc47ad9c0ec1080768de1e --repeats 5
 ```
 
-See the [usage guide](USAGE.md#measured-speedups-vs-upstream-base) and [benchmark guide](benchmarks/README.md) for details.
+Repeat with all five limits set to `"2"`. See the
+[usage guide](USAGE.md#measured-speedups-vs-upstream-base) for both timing tables,
+full environment details, and limitations, and the
+[benchmark guide](benchmarks/README.md) for other benchmark options.
 
 ## Upstream base and maintenance
 
@@ -81,6 +102,7 @@ For the official package, documentation, and support channels, visit
 
 | Section | Description |
 |-|-|
+| [Measured performance](#measured-performance) | Speedups against upstream commit 99cf640 |
 | [Installation](#installation) | Installing the dependencies and tslearn |
 | [Getting started](#getting-started) | A quick introduction on how to use tslearn |
 | [Available features](#available-features) | An extensive overview of tslearn's functionalities |

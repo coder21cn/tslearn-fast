@@ -28,7 +28,7 @@ from .soft_dtw_fast import (
     _soft_dtw_grad,
 )
 from ._softdtw_fast import cdist_soft_dtw_fast, self_soft_dtw_diag_fast
-from .utils import _cdist_generic
+from .utils import _cdist_generic, _numba_allows_concurrent_calls
 
 __author__ = "Romain Tavenard romain.tavenard[at]univ-rennes2.fr"
 
@@ -885,7 +885,8 @@ def  _cdist_soft_dtw(
     # Non-finite gamma: the fast kernel divides by gamma inside numba
     # and surfaces a SystemError; defer to the legacy path which raises
     # ZeroDivisionError (matching main).
-    if be.is_numpy and not math.isclose(gamma, 0.0) and math.isfinite(gamma):
+    if (be.is_numpy and not math.isclose(gamma, 0.0) and math.isfinite(gamma)
+            and _numba_allows_concurrent_calls()):
         return cdist_soft_dtw_fast(
             dataset1=dataset1, dataset2=dataset2, gamma=gamma,
             verbose=verbose,
@@ -1064,7 +1065,7 @@ def _cdist_soft_dtw_normalized(
         d_ii = be.diag(dists)
         normalizer = -0.5 * (be.reshape(d_ii, (-1, 1)) + be.reshape(d_ii, (1, -1)))
     elif (be.is_numpy and not math.isclose(gamma, 0.0)
-            and math.isfinite(gamma)):
+            and math.isfinite(gamma) and _numba_allows_concurrent_calls()):
         # Use the fused self-diagonal kernel so the self-distances are
         # bit-equal to the cross kernel's diagonal. Non-finite gamma falls
         # through to the per-pair legacy loop so the divide-by-gamma

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from tslearn.piecewise import OneD_SymbolicAggregateApproximation, \
     SymbolicAggregateApproximation, PiecewiseAggregateApproximation
@@ -22,6 +23,18 @@ def test_paa():
     paa_repr = paa_est.fit_transform(X)
     np.testing.assert_allclose(paa_est.distance(X[0], X[1]),
                                paa_est.distance_paa(paa_repr[0], paa_repr[1]))
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, np.int32])
+def test_paa_preserves_float64_output(dtype):
+    X = np.array([[0., 0., 0., 0.], [1000., 1000., 1000., 1000.]], dtype=dtype)
+    paa = PiecewiseAggregateApproximation(n_segments=2)
+    transformed = paa.fit_transform(X)
+    assert transformed.dtype == np.float64
+    np.testing.assert_array_equal(paa.transform(X), transformed)
+    np.testing.assert_array_equal(paa.inverse_transform(transformed), X[..., None])
+    np.testing.assert_allclose(paa.distance_paa(transformed[0], transformed[1]), 2000.)
+    np.testing.assert_allclose(paa.distance(X[0], X[1]), 2000.)
 
 
 def test_sax():

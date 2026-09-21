@@ -5,6 +5,7 @@ from sklearn.base import TransformerMixin, BaseEstimator
 from sklearn.utils.validation import check_is_fitted
 
 from tslearn.bases import BaseModelPackage, TimeSeriesMixin
+from tslearn.metrics.utils import _numba_allows_concurrent_calls
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 from tslearn.utils import check_array, check_dims
 from ._mp_fast import _run_mp_stomp
@@ -183,7 +184,8 @@ class MatrixProfile(TimeSeriesMixin,
                 # STOMP's std>EPS guard and the unscaled formula both
                 # silently swallow NaN cells, so non-finite inputs
                 # diverge from main's pdist path. Fall back per series.
-                if np.isfinite(ts).all() and self._stomp_safe(ts):
+                if (np.isfinite(ts).all() and self._stomp_safe(ts)
+                        and _numba_allows_concurrent_calls()):
                     mins_sq = np.empty(output_size, dtype=np.float64)
                     _run_mp_stomp(
                         ts, self.subsequence_length, self.scale,
@@ -216,16 +218,19 @@ class MatrixProfile(TimeSeriesMixin,
         segment first and avoids the cancellation. When the ratio is
         too high, fall back to pdist to preserve numerical parity.
 
-        For ``scale=False`` STOMP is numerically well-behaved and we
-        always take the fast path.
+        The unscaled squared-norm formula also suffers cancellation on
+        large-offset signals, so apply the same gate in both modes.
+        Scaled inputs with tiny standard deviations use the fallback
+        because the kernel treats standard deviations <= 1e-12 as zero.
+        Large changes in window energy also require the fallback: running
+        sums retain roundoff from earlier high-energy windows.
         """
-        if not self.scale:
-            return True
         m = self.subsequence_length
         sz = ts.shape[0]
         n = sz - m + 1
         if n < 1:
-            return True
+            # Preserve the fallback's validation when no windows exist.
+            return False
         cs = np.concatenate(
             [np.zeros((1, ts.shape[1])),
              np.cumsum(ts, axis=0, dtype=np.float64)]
@@ -236,12 +241,19 @@ class MatrixProfile(TimeSeriesMixin,
         )
         sums = cs[m:m + n] - cs[:n]
         sums2 = cs2[m:m + n] - cs2[:n]
+        # Keep each window's energy well above the accumulated roundoff
+        # scale. Otherwise neither running norms nor dot products remain
+        # accurate after a sharp drop in signal amplitude.
+        if (sums2 <= 1e-6 * cs2[-1]).any():
+            return False
         mu = sums / m
         var = np.maximum(sums2 / m - mu * mu, 0.0)
         sig = np.sqrt(var)
-        # 50 picked empirically: at ratio=50, cancellation costs ~3
-        # decimal digits of the ~16 in float64, leaving the recurrence
-        # well within main's pdist parity tolerance (1e-9 in the harness).
+        if self.scale and (sig <= 1e-12).any():
+            return False
+        # Reject strongly ill-conditioned window statistics. The kernel
+        # separately recomputes near-match distances to account for the
+        # cancellation that can still occur below this mean/std limit.
         return bool((np.abs(mu) <= 50.0 * (sig + 1e-12)).all())
 
     def _numpy_pdist_matrix_profile(self, ts, band_width):
@@ -253,7 +265,8 @@ class MatrixProfile(TimeSeriesMixin,
         if self.scale:
             segments = TimeSeriesScalerMeanVariance().fit_transform(segments)
         n = segments.shape[0]
-        flat = segments.reshape(n, m * ts.shape[1])
+        # Match upstream's reshape, including its error for zero-size windows.
+        flat = segments.reshape(-1, m * ts.shape[1])
         dists = squareform(pdist(flat, metric="euclidean"))
         band = (np.tri(n, n, band_width, dtype=bool)
                 & ~np.tri(n, n, -(band_width + 1), dtype=bool))

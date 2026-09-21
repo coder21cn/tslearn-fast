@@ -14,7 +14,16 @@ from tslearn.backend.pytorch_backend import HAS_TORCH
 from tslearn.utils import  to_time_series, to_time_series_dataset
 from tslearn.utils.utils import _to_time_series
 
-from .utils import _cdist_generic
+from .utils import _cdist_generic, _numba_allows_concurrent_calls
+
+
+def _gak_fast_sigma_safe(sigma):
+    """Whether the bandwidth is safe for the fused kernel's reciprocal."""
+    sigma = float(sigma)
+    # Keep subnormal squares on the legacy path: fastmath's reciprocal
+    # rewrites can overflow even near the cutoff where Python's direct
+    # 1 / (2 * sigma * sigma) still returns a finite value.
+    return math.isfinite(sigma) and sigma * sigma >= numpy.finfo(float).tiny
 
 
 def _normalize_by_inv_sqrt(M, l, r):
@@ -267,11 +276,13 @@ def unnormalized_gak(s1, s2, sigma=1.0, be=None):
 
 
 def _unnormalized_gak(s1, s2, sigma, backend):
-    if backend.is_numpy and math.isfinite(sigma):
+    if (backend.is_numpy and _gak_fast_sigma_safe(sigma)
+            and _numba_allows_concurrent_calls()):
         # Single-pair via the fused cdist kernel — avoids materializing a
         # per-pair (sz1, sz2) gram matrix and the cdist/log/exp triplet.
-        # Non-finite sigma falls through to the legacy gram path so the
-        # NaN propagation matches main (the kernel raises instead).
+        # Unsafe bandwidths and workqueue use the serial legacy path.
+        # Even a one-thread parallel kernel aborts under workqueue when
+        # callers evaluate this public metric from multiple Python threads.
         from ._gak_fast import cdist_gak_fast
         return float(
             cdist_gak_fast(s1[None, ...], s2[None, ...], float(sigma))[0, 0]
@@ -421,11 +432,10 @@ def _cdist_gak(
     if be is None:
        be = instantiate_backend(dataset1, dataset2)
 
-    # Non-finite sigma: the fused kernel's ``1 / (2 * sigma * sigma)`` is
-    # surfaced by numba as a ZeroDivisionError; main propagates NaN
-    # through the per-pair Python loop. Defer to the legacy path so the
-    # output matches.
-    if be.is_numpy and math.isfinite(sigma):
+    # Avoid an unsafe reciprocal scale, including finite small bandwidths
+    # where zero cell distances would become NaN through ``0 * inf``.
+    if (be.is_numpy and _gak_fast_sigma_safe(sigma)
+            and _numba_allows_concurrent_calls()):
         from ._gak_fast import cdist_gak_fast, gak_self_diag_fast
         unnormalized_matrix = cdist_gak_fast(
             dataset1=dataset1, dataset2=dataset2, sigma=sigma,
@@ -499,7 +509,8 @@ def _gak_self_inv_sqrt_diag(dataset, sigma, n_jobs=None, verbose=0, be=None):
         # silently propagates as NaN out of the ``1/sqrt(0)`` step here.
         raise ZeroDivisionError("Sigma must be non-zero.")
     be = instantiate_backend(be, dataset)
-    if be.is_numpy and math.isfinite(sigma):
+    if (be.is_numpy and _gak_fast_sigma_safe(sigma)
+            and _numba_allows_concurrent_calls()):
         from ._gak_fast import gak_self_diag_fast
         return 1.0 / be.sqrt(gak_self_diag_fast(dataset, sigma))
     diag = Parallel(n_jobs=n_jobs, prefer="threads", verbose=verbose)(

@@ -263,12 +263,13 @@ def cdist_frechet_fast(
             out = numpy.zeros((n, n), dtype=numpy.float64)
             if n == 0:
                 return out
-            # Defer to legacy mask path for non-int-valued / non-finite
+            # Defer to legacy mask path for negative / non-int-valued / non-finite
             # radii: main accepts these and the mask handles them, but our
             # int-bound range kernels can't. Check after empty returns so
             # zero-pair calls do not inspect radius values.
             if (sakoe_chiba_radius is not None
-                    and not _is_int_valued_finite(sakoe_chiba_radius)):
+                    and (not _is_int_valued_finite(sakoe_chiba_radius)
+                         or sakoe_chiba_radius < 0)):
                 return None
             if use_sakoe:
                 # Numba kernels need ``radius`` as int (used in
@@ -303,12 +304,13 @@ def cdist_frechet_fast(
             raise ValueError(
                 "All input time series must have the same feature size."
             )
-        # Defer to legacy mask path for non-int-valued / non-finite radii:
+        # Defer to legacy mask path for negative / non-int-valued / non-finite radii:
         # main accepts these and the mask handles them, but our int-bound
         # range kernels can't. Check after empty and feature-dimension
         # short-circuits to preserve public error ordering.
         if (sakoe_chiba_radius is not None
-                and not _is_int_valued_finite(sakoe_chiba_radius)):
+                and (not _is_int_valued_finite(sakoe_chiba_radius)
+                     or sakoe_chiba_radius < 0)):
             return None
         if use_sakoe:
             # Numba kernels need ``radius`` as int (used in ``range(...)``);

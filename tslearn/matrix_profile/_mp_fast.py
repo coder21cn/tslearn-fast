@@ -12,6 +12,36 @@ from numba import njit, prange, get_num_threads, get_thread_id
 import numpy
 
 
+@njit(nogil=True, cache=True)
+def _scaled_distance_sq(X, i, j, m):
+    """Stable z-normalized distance for a cancellation-prone window pair."""
+    dist_sq = 0.0
+    for di in range(X.shape[1]):
+        mu_i = 0.0
+        mu_j = 0.0
+        for k in range(m):
+            mu_i += X[i + k, di]
+            mu_j += X[j + k, di]
+        mu_i /= m
+        mu_j /= m
+        var_i = 0.0
+        var_j = 0.0
+        for k in range(m):
+            var_i += (X[i + k, di] - mu_i) ** 2
+            var_j += (X[j + k, di] - mu_j) ** 2
+        sig_i = numpy.sqrt(var_i / m)
+        sig_j = numpy.sqrt(var_j / m)
+        if sig_i == 0.0:
+            sig_i = 1.0
+        if sig_j == 0.0:
+            sig_j = 1.0
+        for k in range(m):
+            diff = ((X[i + k, di] - mu_i) / sig_i
+                    - (X[j + k, di] - mu_j) / sig_j)
+            dist_sq += diff * diff
+    return dist_sq
+
+
 def _run_mp_stomp(X, m, scale, band_width, mins_sq):
     """STOMP matrix profile for a single multivariate time series.
 
@@ -144,10 +174,19 @@ def _njit_mp_stomp_kernel(
 
             if scale:
                 dist_sq = 0.0
+                cancellation_scale = 2.0 * m * d
                 for di in range(d):
                     s_i = sig[i, di]
                     s_j = sig[j, di]
                     if s_i > EPS and s_j > EPS:
+                        # The centered dot product and the variances lose
+                        # precision in proportion to the squared mean/std
+                        # ratios, even when the normalized distance is not
+                        # tiny relative to 2*m alone.
+                        cancellation_scale += 2.0 * m * (
+                            (mu[i, di] / s_i) ** 2
+                            + (mu[j, di] / s_j) ** 2
+                        )
                         inner = (
                             qt[di] - m * mu[i, di] * mu[j, di]
                         ) / (s_i * s_j)
@@ -158,11 +197,25 @@ def _njit_mp_stomp_kernel(
                         # contribution is ||z||^2 = m.
                         dist_sq += m
                     # else both constant: per-dim contribution is 0.
+                # The correlation formula loses precision for nearly
+                # identical normalized windows, just like the raw formula.
+                # Leave headroom for roundoff accumulated by the recurrence.
+                if dist_sq <= 1e-6 * cancellation_scale:
+                    dist_sq = _scaled_distance_sq(X, i, j, m)
             else:
                 qt_total = 0.0
                 for di in range(d):
                     qt_total += qt[di]
                 dist_sq = norm_sq[i] + norm_sq[j] - 2.0 * qt_total
+                # Nearly equal, energetic windows lose their small distance
+                # in the squared-norm subtraction. Recompute only these
+                # pairs from differences, which do not suffer cancellation.
+                if dist_sq <= 1e-6 * (norm_sq[i] + norm_sq[j]):
+                    dist_sq = 0.0
+                    for k in range(m):
+                        for di in range(d):
+                            diff = X[i + k, di] - X[j + k, di]
+                            dist_sq += diff * diff
 
             if dist_sq < 0.0:
                 dist_sq = 0.0

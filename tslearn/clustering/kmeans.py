@@ -23,7 +23,9 @@ from tslearn.metrics import (
     _sigma_gak as sigma_gak
 )
 from tslearn.metrics._dtw_lb import cdist_dtw_topk_fast
-from tslearn.metrics.utils import _sakoe_radius_for_fast_path, numba_threads_for
+from tslearn.metrics.utils import (
+    _numba_allows_concurrent_calls, _sakoe_radius_for_fast_path, numba_threads_for,
+)
 from tslearn.utils import (
     check_array,
     check_dims,
@@ -739,7 +741,7 @@ class TimeSeriesKMeans(
         if self.metric == "dtw":
             metric_params = self._get_metric_params()
             radius = _sakoe_radius_for_fast_path(metric_params)
-            if radius is not None:
+            if radius is not None and _numba_allows_concurrent_calls():
                 top1 = cdist_dtw_topk_fast(
                     dataset_query=X,
                     dataset_candidates=self.cluster_centers_,
@@ -786,7 +788,9 @@ class TimeSeriesKMeans(
         parallel_metric = self.metric in ("dtw", "softdtw")
         if (parallel_metric
                 and self.n_jobs not in (None, 1)
-                and self.n_clusters > 1):
+                and self.n_clusters > 1
+                and (self.metric != "softdtw"
+                     or _numba_allows_concurrent_calls())):
             from joblib import Parallel, delayed
             # Force numba to one thread inside each outer worker so we don't
             # spawn ``n_jobs * NUMBA_NUM_THREADS`` OS threads — Soft-DTW

@@ -121,10 +121,12 @@ class TimeSeriesResampler(TimeSeriesMixin, TransformerMixin, BaseEstimator):
             # are identical across (i, d), so fold the per-(i, d) np.interp
             # loop into a single broadcast linear interpolation.
             u = numpy.linspace(0, 1, target_sz)
-            s = u * (sz - 1)
-            floor = numpy.floor(s).astype(numpy.int64)
+            source = numpy.linspace(0, 1, sz)
+            floor = numpy.searchsorted(source, u, side="right") - 1
             numpy.clip(floor, 0, sz - 2, out=floor)
-            frac = s - floor
+            # Use the same grid as np.interp: multiplying u by (sz - 1)
+            # can move an exact sample slightly into its neighboring interval.
+            frac = (u - source[floor]) / (source[floor + 1] - source[floor])
             w0 = (1.0 - frac)[None, :, None]
             w1 = frac[None, :, None]
             return X_[:, floor, :] * w0 + X_[:, floor + 1, :] * w1

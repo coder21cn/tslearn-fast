@@ -28,6 +28,68 @@ from tslearn.utils import to_time_series_dataset, ts_size
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
 
 
+@pytest.mark.parametrize("estimator", ["softdtw", "kshape"])
+def test_workqueue_centroid_updates_are_serial(estimator):
+    # Isolate backend selection (and any native abort on a regression) from
+    # the main pytest process, whose Numba runtime may already be initialized.
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import sys
+        import joblib
+        import numpy as np
+        from numba import threading_layer, get_num_threads
+        from tslearn.clustering import TimeSeriesKMeans, KShape
+        from tslearn.preprocessing import TimeSeriesScalerMeanVariance
+
+        X = np.random.RandomState(3).randn(8, 8, 1) * 0.1
+        X[:4] -= 1
+        X[4:] += 1
+        if sys.argv[1] == 'softdtw':
+            cls = TimeSeriesKMeans
+            extra = dict(metric='softdtw', max_iter_barycenter=3)
+        else:
+            cls = KShape
+            extra = {}
+            X = TimeSeriesScalerMeanVariance().fit_transform(X)
+        kwargs = dict(n_clusters=2, init=X[[0, 4]].copy(),
+                      random_state=0, max_iter=3, **extra)
+        reference = cls(n_jobs=1, **kwargs).fit(X)
+        assert threading_layer() == 'workqueue'
+
+        def unsafe_parallel_launch(*args, **kwargs):
+            raise AssertionError('Parallel centroid launch under workqueue')
+
+        # Fail safely before the old code could abort the worker. The real
+        # Numba kernels still execute in the expected serial fallback.
+        joblib.Parallel = unsafe_parallel_launch
+        actual = cls(n_jobs=2, **kwargs).fit(X)
+        np.testing.assert_array_equal(actual.labels_, reference.labels_)
+        np.testing.assert_allclose(actual.cluster_centers_,
+                                   reference.cluster_centers_, atol=1e-9)
+        assert get_num_threads() == 2
+    """)
+    env = dict(os.environ, NUMBA_THREADING_LAYER="workqueue",
+               NUMBA_NUM_THREADS="2", OMP_NUM_THREADS="2")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script, estimator],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    print(f"workqueue regression worker PID={proc.pid}", flush=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        pytest.fail(f"Worker {proc.pid} timed out: {stdout}\n{stderr}")
+    assert proc.returncode == 0, f"Worker {proc.pid}: {stdout}\n{stderr}"
+
+
 def test_check_no_empty_cluster():
     labels = np.array([1, 1, 2, 0, 2])
     _check_no_empty_cluster(labels, 3)

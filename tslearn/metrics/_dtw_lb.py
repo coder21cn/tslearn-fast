@@ -209,7 +209,8 @@ def cdist_dtw_topk_fast(
         candidates pass.
     None
         If the inputs don't satisfy the fast-path constraints (equal valid
-        length across all series, ``radius`` set, matching dim).
+        length across all series, ``radius`` set, matching dim), or distance
+        overflow prevents filling the available neighbor slots.
     """
     if radius is None or radius < 0:
         return None
@@ -255,4 +256,10 @@ def cdist_dtw_topk_fast(
         _njit_cdist_dtw_topk_sakoe(
             X, Y, lens_X, lens_Y, U, L, int(radius), int(k), dists, idxs
         )
+        # Finite inputs can overflow squared distances. Pruning then leaves
+        # -1 slots even with enough candidates; let the full-distance path
+        # rank those infinite distances instead. Ignore intentional padding
+        # beyond the candidate count when k is oversized.
+        if (idxs[:, :min(k, Y.shape[0])] < 0).any():
+            return None
         return dists, idxs

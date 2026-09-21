@@ -7,7 +7,7 @@ from sklearn.utils.validation import check_is_fitted
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 from tslearn.utils import to_time_series_dataset, check_dims, check_array
 from tslearn.metrics import cdist_normalized_cc, y_shifted_sbd_vec
-from tslearn.metrics.utils import numba_threads_for
+from tslearn.metrics.utils import _numba_allows_concurrent_calls, numba_threads_for
 from tslearn.bases import BaseModelPackage
 
 from .utils import (TimeSeriesCentroidBasedClusteringMixin,
@@ -167,7 +167,8 @@ class KShape(TimeSeriesCentroidBasedClusteringMixin,
         # numba to one thread inside each outer worker so we don't spawn
         # ``n_jobs * numba_default_threads`` OS threads (oversubscription
         # was the source of the surprisingly-large measured speedups).
-        if self.n_jobs not in (None, 1) and self.n_clusters > 1:
+        if (self.n_jobs not in (None, 1) and self.n_clusters > 1
+                and _numba_allows_concurrent_calls()):
             from joblib import Parallel, delayed
 
             def _extract_one(k):

@@ -155,10 +155,13 @@ class PiecewiseAggregateApproximation(TimeSeriesMixin,
             sz_segment = sz // n_seg
             if sz_segment > 0:
                 truncated = sz_segment * n_seg
+                # Match the legacy float64 output, keeping the mean's
+                # original input-dtype precision before the conversion.
                 return (
                     X[:, :truncated, :]
                     .reshape(n_ts, n_seg, sz_segment, d)
                     .mean(axis=2)
+                    .astype(float, copy=False)
                 )
         X_transformed = numpy.empty((n_ts, n_seg, d))
         for i_ts in range(n_ts):

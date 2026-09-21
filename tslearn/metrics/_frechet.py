@@ -17,6 +17,7 @@ from .utils import (
     _cdist_generic,
     _njit_compute_path,
     _compute_path,
+    _numba_allows_concurrent_calls,
 )
 
 
@@ -805,7 +806,8 @@ def _cdist_frechet(
     use_itakura = constraint_code == itakura_code or (
         constraint_code == no_constraint_code and itakura_max_slope is not None
     )
-    if be.is_numpy and not use_itakura:
+    if (be.is_numpy and not use_itakura
+            and _numba_allows_concurrent_calls()):
         from ._frechet_fast import cdist_frechet_fast
         result = cdist_frechet_fast(
             dataset1=dataset1,

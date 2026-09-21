@@ -17,7 +17,9 @@ from tslearn.metrics import (
     TSLEARN_VALID_METRICS
 )
 from tslearn.metrics._dtw_lb import cdist_dtw_topk_fast
-from tslearn.metrics.utils import _sakoe_radius_for_fast_path
+from tslearn.metrics.utils import (
+    _numba_allows_concurrent_calls, _sakoe_radius_for_fast_path,
+)
 from tslearn.piecewise import SymbolicAggregateApproximation
 from tslearn.utils import (
     to_time_series_dataset,
@@ -401,7 +403,8 @@ class KNeighborsTimeSeries(KNeighborsTimeSeriesMixin,
                     k=k_eff,
                     radius=radius,
                     n_jobs=self.n_jobs,
-                ) if radius is not None and k_eff >= 1 else None
+                ) if (radius is not None and k_eff >= 1
+                      and _numba_allows_concurrent_calls()) else None
                 if fast is not None:
                     self.metric = self._ts_metric
                     if return_distance:

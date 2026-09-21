@@ -558,11 +558,12 @@ def cdist_dtw_fast(
     _raise_if_ambiguous_constraint(
         global_constraint, sakoe_chiba_radius, itakura_max_slope,
     )
-    # Defer to legacy mask path for non-int-valued / non-finite radii:
+    # Defer to legacy mask path for negative / non-int-valued / non-finite radii:
     # main accepts these and the mask handles them, but our int-bound
     # range kernels can't.
     if (sakoe_chiba_radius is not None
-            and not _is_int_valued_finite(sakoe_chiba_radius)):
+            and (not _is_int_valued_finite(sakoe_chiba_radius)
+                 or sakoe_chiba_radius < 0)):
         return None
     use_sakoe = global_constraint == SAKOE_CHIBA or (
         global_constraint == NO_CONSTRAINT and sakoe_chiba_radius is not None

@@ -131,9 +131,10 @@ def self_soft_dtw_diag_fast(dataset, gamma):
 @njit(parallel=True, fastmath=True, nogil=True, cache=True)
 def _njit_softdtw_obj_grad(Z, X, lens_X, gamma, value_per_i, G_per_i):
     """Per-i Soft-DTW barycenter objective + gradient. Computes
-    ``value_per_i[i] = soft_dtw(Z, X[i])`` and
-    ``G_per_i[i] = 2 * (Z * E.sum(1) - E @ X[i])`` where ``E`` is the
-    soft-DTW gradient matrix. Caller weights and reduces across ``i``.
+    ``value_per_i[i] = soft_dtw(Z, X[i])``.
+    The gradient sums ``2 * E[ii, jj] * (Z[ii] - X[i, jj])`` over ``jj``,
+    where ``E`` is the soft-DTW gradient matrix. Caller weights and
+    reduces across ``i``.
 
     Z : (m, d) float64
     X : (n_X, max_n, d) float64
@@ -173,17 +174,15 @@ def _njit_softdtw_obj_grad(Z, X, lens_X, gamma, value_per_i, G_per_i):
         E = numpy.zeros((m + 2, n_i + 2), dtype=numpy.float64)
         _njit_soft_dtw_grad(D, R, E, gamma)
 
-        # Jacobian product for squared euclidean: G[ii, k] =
-        #   2 * (Z[ii, k] * sum_j E[ii+1, j+1] - sum_j E[ii+1, j+1] * X[i, j, k])
+        # Subtract samples before weighting: subtracting two large weighted
+        # sums loses the gradient when the series share a large offset.
         for ii in range(m):
-            row_sum = 0.0
-            for jj in range(n_i):
-                row_sum += E[ii + 1, jj + 1]
             for k in range(d):
                 acc = 0.0
                 for jj in range(n_i):
-                    acc += E[ii + 1, jj + 1] * X[i, jj, k]
-                G_per_i[i, ii, k] = 2.0 * (Z[ii, k] * row_sum - acc)
+                    diff = Z[ii, k] - X[i, jj, k]
+                    acc += 2.0 * E[ii + 1, jj + 1] * diff
+                G_per_i[i, ii, k] = acc
 
 
 def softdtw_obj_grad_fast(Z, X_padded, lens_X, weights, gamma):

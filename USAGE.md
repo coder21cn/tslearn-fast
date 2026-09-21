@@ -190,32 +190,91 @@ process.
 
 ## Measured speedups vs upstream base
 
-Side-by-side timing against upstream commit `99cf640` using `tests/bench_vs_main.py`. Values are the median of three runs after a JIT warm-up on an Intel Core i5-11400 with Python 3.13.14, NumPy 2.5.1, and Numba 0.67.0:
+These measurements of the corrected implementation replace the earlier
+performance figures. It remains faster than upstream commit `99cf640` in
+all 11 scenarios. Earlier figures should not be treated as measurements of
+this corrected implementation; differences from historical results do not
+isolate the overhead of the fixes without matching all benchmark conditions.
 
-| scenario | upstream | tslearn-fast | speedup |
+### Method and environment
+
+- Measured on 2026-09-21 against upstream commit
+  `99cf640bcc759fdf65dc47ad9c0ec1080768de1e`.
+- Measured implementation: `tslearn/` Git tree
+  `ad86b6d03fd8a774685c38ede322f7bd73459cbc` (unchanged by this documentation update).
+- Intel Core i5-11400 @ 2.60 GHz, 6 physical cores / 12 logical processors;
+  Windows 11.
+- Python 3.13.14, NumPy 2.5.1, Numba 0.67.0, SciPy 1.18.0,
+  scikit-learn 1.9.0, and joblib 1.5.3; Numba threading layer `omp` (OpenMP).
+- Existing scenarios from `tests/bench_vs_main.py`, with helpers from
+  `tests/_bench_runner.py`; identical deterministic inputs (seed 0).
+- Median of five timed calls after one untimed JIT warm-up per scenario;
+  startup and compilation excluded. Baseline ran before the fork for each profile.
+- `NUMBA_NUM_THREADS`, `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `MKL_NUM_THREADS`, and `NUMEXPR_NUM_THREADS` were all set to 1 or 2,
+  identically for both versions. These are limits, not forced thread counts;
+  default API `n_jobs` settings were preserved.
+
+All 22 benchmark-output comparisons matched at `rtol=1e-7, atol=1e-9`.
+This checks the benchmark helpers' return values (for example, labels for
+k-means), not every estimator attribute.
+
+### One-thread limit
+
+| Scenario | 99cf640 (ms) | tslearn-fast (ms) | Speedup |
 |---|---:|---:|---:|
-| `cdist_dtw[N=100, L=32]` | 0.0549s | 0.0073s | **7.48×** |
-| `cdist_dtw[N=200, L=64]` | 0.4742s | 0.1265s | **3.75×** |
-| `cdist_dtw[N=80, L=200, sakoe=10]` | 0.1591s | 0.0354s | **4.50×** |
-| `cdist_dtw[N=40, L=400, multivariate d=5]` | 0.8484s | 0.2560s | **3.31×** |
-| `cdist_soft_dtw[N=100, L=32]` | 1.4102s | 0.0476s | **29.61×** |
-| `cdist_gak[N=100, L=32]` | 0.1816s | 0.0395s | **4.59×** |
-| `cdist_frechet[N=100, L=32]` | 0.0552s | 0.0103s | **5.37×** |
-| `KNeighborsTimeSeries(metric='dtw').kneighbors[N=200×50, sakoe=4, k=3]` | 0.1225s | 0.0192s | **6.39×** |
-| `TimeSeriesKMeans(metric='dtw').fit_predict[N=80, k=4, sakoe=3]` | 0.1504s | 0.0433s | **3.47×** |
-| `softdtw_barycenter[N=20, L=24, max_iter=20]` | 0.4381s | 0.0293s | **14.97×** |
-| `MatrixProfile.fit_transform[L=1000, m=32]` | 0.0285s | 0.0017s | **16.82×** |
+| `cdist_dtw[N=100, L=32]` | 56.016 | 7.438 | 7.53× |
+| `cdist_dtw[N=200, L=64]` | 487.905 | 117.762 | 4.14× |
+| `cdist_dtw[N=80, L=200, sakoe=10]` | 161.027 | 34.846 | 4.62× |
+| `cdist_dtw[N=40, L=400, multivariate d=5]` | 794.707 | 248.753 | 3.19× |
+| `cdist_soft_dtw[N=100, L=32]` | 1420.777 | 216.345 | 6.57× |
+| `cdist_gak[N=100, L=32]` | 186.412 | 36.425 | 5.12× |
+| `cdist_frechet[N=100, L=32]` | 54.708 | 10.008 | 5.47× |
+| `kneighbors_dtw[N_train=200, N_test=50, L=64, sakoe=4, k=3]` | 122.428 | 16.502 | 7.42× |
+| `kmeans_dtw[N=80, L=32, k=4, sakoe=3]` | 148.621 | 42.900 | 3.46× |
+| `softdtw_barycenter[N=20, L=24]` | 244.235 | 24.064 | 10.15× |
+| `matrix_profile[N=1, L=1000, m=32]` | 28.830 | 4.027 | 7.16× |
 
-Results vary with data shape, hardware, threading, and dependency versions. Reproduce with:
+### Two-thread limit
 
-```bash
-python tests/bench_vs_main.py --main-rev 99cf640bcc759fdf65dc47ad9c0ec1080768de1e --repeats 3
+| Scenario | 99cf640 (ms) | tslearn-fast (ms) | Speedup |
+|---|---:|---:|---:|
+| `cdist_dtw[N=100, L=32]` | 58.657 | 7.429 | 7.90× |
+| `cdist_dtw[N=200, L=64]` | 489.441 | 117.122 | 4.18× |
+| `cdist_dtw[N=80, L=200, sakoe=10]` | 161.043 | 34.851 | 4.62× |
+| `cdist_dtw[N=40, L=400, multivariate d=5]` | 799.504 | 248.266 | 3.22× |
+| `cdist_soft_dtw[N=100, L=32]` | 1423.356 | 165.173 | 8.62× |
+| `cdist_gak[N=100, L=32]` | 185.269 | 36.422 | 5.09× |
+| `cdist_frechet[N=100, L=32]` | 55.444 | 10.277 | 5.39× |
+| `kneighbors_dtw[N_train=200, N_test=50, L=64, sakoe=4, k=3]` | 123.415 | 16.541 | 7.46× |
+| `kmeans_dtw[N=80, L=32, k=4, sakoe=3]` | 149.901 | 44.464 | 3.37× |
+| `softdtw_barycenter[N=20, L=24]` | 243.140 | 19.868 | 12.24× |
+| `matrix_profile[N=1, L=1000, m=32]` | 28.940 | 2.907 | 9.96× |
+
+The k-means scenario uses `max_iter=3`, `n_init=1`, and `random_state=0`;
+the Soft-DTW barycenter uses `gamma=1.0` and `max_iter=20`; matrix profile
+uses `implementation="numpy"` and `scale=True`.
+
+These synthetic, warm-run measurements on one machine are not guarantees for
+all workloads. They do not measure cold starts, memory use, the workqueue
+backend, or numerical edge cases that deliberately use slower fallbacks.
+
+### Reproduce the timings
+
+From the repository root, in PowerShell:
+
+```powershell
+$env:NUMBA_NUM_THREADS = "1"
+$env:OMP_NUM_THREADS = "1"
+$env:OPENBLAS_NUM_THREADS = "1"
+$env:MKL_NUM_THREADS = "1"
+$env:NUMEXPR_NUM_THREADS = "1"
+python tests/bench_vs_main.py --main-rev 99cf640 --repeats 5
 ```
 
-K-Means now matches the rest of the suite after fusing DBA's per-
-iteration assignment+update into a vectorized `numpy.add.at` +
-`numpy.bincount` scatter (the legacy per-position `numpy.average` loop
-was the dominant cost on small problems, not the DTW kernel itself).
+Repeat with all five limits set to `"2"`. Use the dependency versions above
+for a comparable environment. The command reports timings; output parity was
+checked separately during this rerun.
 
 ## Benchmarks
 

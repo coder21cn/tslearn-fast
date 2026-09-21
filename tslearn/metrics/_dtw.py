@@ -18,6 +18,7 @@ from .utils import (
     _compute_path,
     _cdist_generic,
     _is_int_valued_finite,
+    _numba_allows_concurrent_calls,
 )
 from ._dtw_fast import (
     cdist_dtw_fast,
@@ -32,7 +33,7 @@ def _sakoe_fast_inputs(
     """Gate for the single-pair Sakoe-Chiba fast path. Returns
     ``(s1c, s2c, radius)`` if the fused kernel is safe to call, else ``None``.
 
-    The kernel is unconstrained-or-Sakoe only, requires an int-valued radius,
+    The kernel requires a non-negative, int-valued Sakoe-Chiba radius,
     and the band-iteration recurrence chooses different ties on NaN/Inf
     cells than the legacy mask DP — fall back when any non-finite value is
     present so callers can rely on parity.
@@ -40,6 +41,7 @@ def _sakoe_fast_inputs(
     if not (be.is_numpy
             and itakura_max_slope is None
             and sakoe_chiba_radius is not None
+            and sakoe_chiba_radius >= 0
             and global_constraint_ != GLOBAL_CONSTRAINT_CODE["itakura"]
             and _is_int_valued_finite(sakoe_chiba_radius)):
         return None
@@ -615,7 +617,7 @@ def _cdist_dtw(
 
     constraint_code = GLOBAL_CONSTRAINT_CODE[global_constraint]
 
-    if be.is_numpy:
+    if be.is_numpy and _numba_allows_concurrent_calls():
         result = cdist_dtw_fast(
             dataset1=dataset1,
             dataset2=dataset2,
